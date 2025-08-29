@@ -12,3 +12,7 @@ log/*
 
 data/*
 !data/amazon18/.gitkeep
+
+src/index/log/
+!src/index/log/.gitkeep
+

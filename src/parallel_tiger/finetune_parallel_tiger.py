@@ -7,7 +7,6 @@ import torch
 import transformers
 
 from transformers.trainer_callback import TrainerCallback, EarlyStoppingCallback
-from transformers import T5Tokenizer
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -20,15 +19,21 @@ from parallel_tiger.model.model_t5 import T54Rec
 from parallel_tiger.model.config import (
     create_config_from_hydra_cfg
 )
-from parallel_tiger.utils.utils import (
+from parallel_tiger.utils.misc import (
     set_seed,
+)
+from parallel_tiger.utils.io import (
     ensure_dir,
+)
+from parallel_tiger.utils.data_loading import (
     load_datasets,
+)
+from parallel_tiger.utils.logging_utils import (
     log_trainable_parameters,
     log_embedding_tables,
 )
-from parallel_tiger.utils.collator import Collator
-from parallel_tiger.utils.custom_tokenizer import (
+from parallel_tiger.data.collator import Collator
+from parallel_tiger.tokenizer.custom_tokenizer import (
     save_custom_vocab,
     load_custom_tokenizer,
 )

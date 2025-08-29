@@ -1,12 +1,8 @@
-# To run file (from root)
-# PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 src/parallel_tiger/test_ddp_parallel_tiger.py exp_name="full_self_attention_separate_codebook_position_bias_w_decoder_bias"
-
 import json
 import os
 import time as t
 import sys
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HYDRA_FULL_ERROR"] = "1"
@@ -18,25 +14,28 @@ import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel
 
-# from peft import PeftModel
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from clearml import Task
+
 from parallel_tiger.model.model_t5 import T54Rec
+from parallel_tiger.tokenizer.custom_tokenizer import CustomT5Tokenizer
 from parallel_tiger.model.config import create_config_from_hydra_cfg
-from parallel_tiger.utils.utils import (
-    set_seed,
+from parallel_tiger.utils.misc import set_seed
+from parallel_tiger.utils.data_loading import (
     load_test_dataset,
+)
+from parallel_tiger.utils.logging_utils import (
     log_embedding_tables,
 )
-from parallel_tiger.utils.collator import TestCollator
-from parallel_tiger.utils.evaluate import get_topk_results, get_metrics_results
-from parallel_tiger.utils.generation_trie import Trie
-from parallel_tiger.utils.generation_constraints import (
+from parallel_tiger.data.collator import TestCollator
+from parallel_tiger.evaluation.metrics import get_topk_results, get_metrics_results
+from parallel_tiger.generation.trie import Trie
+from parallel_tiger.generation.vectorized_constraints import (
     compute_or_load_transition_constraints_codebook_fast,
     parse_item
 )
-from parallel_tiger.utils.custom_tokenizer import CustomT5Tokenizer
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
@@ -94,20 +93,8 @@ def test_ddp(cfg: DictConfig):
     else:
         sys.modules["clearml"] = None
 
-    # TODO: Create a custom load function for T5Tokenizer (from scratch or from a pretrained model)
-    # tokenizer = T5Tokenizer.from_pretrained(
-    #     cfg.infer.ckpt_dir,
-    #     model_max_length=512,
-    #     use_fast=False,
-    #     local_files_only=True,
-    #     cache_dir=cfg.cache_dir
-    # )
     tokenizer = CustomT5Tokenizer.from_pretrained(
         cfg.infer.ckpt_dir,
-        # model_max_length=512,
-        # # use_fast=False,
-        # local_files_only=True,
-        # # cache_dir=cfg.cache_dir
     )
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
@@ -179,7 +166,7 @@ def test_ddp(cfg: DictConfig):
     model = DistributedDataParallel(model, device_ids=[local_rank])
     prompt_ids = [0]
     logger.info("TASK: {}".format(cfg.infer.test_task))
-    test_data = load_test_dataset(cfg)  # SHOULD WE KEEP THIS LINE? (redundant?)
+    test_data = load_test_dataset(cfg)
 
     test_loader = DataLoader(
         test_data,
@@ -227,24 +214,21 @@ def test_ddp(cfg: DictConfig):
                 )
 
                 output_ids = output["sequences"]  # (bs, num_beams, seq_len)
-                # NOTE: in MQL4GRec, output_ids are the token ids - WE PROBABLY WILL NEED TO CHANGE IT
                 scores = output["sequences_scores"]  # (bs, num_beams)
 
                 # Flatten the first two dimensions
                 # to ensure compatibility with MQL4GRec's original implementation
-                # NOTE: ENSURE THIS IS CORRECT
                 output_ids = output_ids.view(
                     -1, output_ids.shape[-1]
                 )  # (bs * num_beams, seq_len)
                 scores = scores.view(-1)  # (bs * num_beams,)
 
-                # NOTE: Add a lookup table for the input_ids to embeddings if I remove the natural language in the embedding matrix
                 output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
                 if cfg.infer.debug:
                     if (
                         local_rank == 0
-                    ):  # reshape output_ids to (bs, num_beams, seq_len)
+                    ):
                         logger.info("scores b: {}".format(scores.reshape(bs, num_beams)))
                         logger.info("output b: {}".format(np.array(output).reshape(bs, num_beams)))
                         logger.info("targets b: {}".format(targets))

@@ -1,0 +1,54 @@
+train: 
+  experiment_name: "${exp_name}_train"
+  optim: "adamw_torch"
+  learning_rate: 1e-3
+  batch_size: 1024
+  micro_batch_size: 512
+  logging_step: 50
+  model_max_length: 2048
+  weight_decay: 0.01
+  resume_from_checkpoint: null  # either training checkpoint or final adapter
+  warmup_ratio: 0.0 #0.01
+  save_and_eval_strategy: "epoch"
+  save_and_eval_steps: 200
+  fp16: false
+  bf16: false
+  gradient_checkpointing: false
+  deepspeed: "./config/ds_z3_bf16.json"
+  patient: 10
+  tasks: "seqrec" # Downstream tasks, separate by comma
+  valid_task: "seqrec"
+
+  training_mode: "standard"
+  normalization_method: "per_sample" # normalization method for the masked training ["per_sample", "per_batch", "unnormalized"]
+
+  num_epochs: 200
+  cutoff_len: 4096
+  val_set_size: 2000
+  lr_scheduler: "cosine"
+  warmup_steps: 100
+  group_by_length: false
+
+  enable_clearml: true
+
+
+hydra:
+  run:
+    dir: ./outputs/${dataset.name}/${quantizer_type}/parallel_TIGER/${exp_name}/train/${now:%Y-%m-%d_%H-%M-%S}
+  
+  job_logging:
+    version: 1
+    root:
+      handlers: [console, file]
+      level: DEBUG
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.run.dir}/train_job.log
+    formatters:
+      simple:
+        format: "[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s"

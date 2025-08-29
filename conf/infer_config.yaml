@@ -1,0 +1,4 @@
+defaults:
+  - common
+  - infer
+  - _self_

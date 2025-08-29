@@ -1,0 +1,4 @@
+defaults:
+  - common
+  - train
+  - _self_

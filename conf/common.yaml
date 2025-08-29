@@ -1,0 +1,47 @@
+seed: 42
+n_query: 4
+code_num: 256
+base_model: "google-t5/t5-small"
+cache_dir: "/home/n.fredholm/sync/SETRec/.cache"
+load_model_name: null
+quantizer_type: "rqvae"
+project_name: "Parallel_TIGER"
+
+exp_name: ???  # To be set from shell script
+output_dir: "./log/${dataset.name}/${quantizer_type}/parallel_TIGER/${exp_name}"
+
+has_relative_encoder_item_bias: true
+has_relative_encoder_codebook_bias: true
+has_relative_decoder_item_bias_sa: true
+has_relative_decoder_codebook_bias_sa: false
+has_relative_decoder_item_bias_ca: false
+has_relative_decoder_codebook_bias_ca: false
+
+projection_strategy: "single" # "single" or "multi". multi means multiple projection heads (one per token/query)
+
+dataset: 
+  data_path: "data/amazon18/"
+  pretrain_datasets: ""   # Comma-separated
+  name: "Arts"
+  index_file: ".index_lemb_${quantizer_type}_${code_num}.json"
+  image_index_file: ".index_vitemb_${quantizer_type}_${code_num}.json"
+  prompt_num: 4
+  num_id_tokens: 1 # Number of identical id tokens to represent items in the ID injection task
+  max_his_len: 20
+  train_data_mode: 0 # 0 for all data, 1 for only responses
+  his_sep: ", " # Separator for history
+  only_train_response: False # Whether to only train on responses
+  only_valid_response: False # Whether to only validate on responses
+  only_valid_first_token: False # Whether to only validate on first token
+  tie_encoder_decoder: False # Whether to tie encoder and decoder weights
+  train_prompt_sample_num: 1 # Number of sampling prompts for each task
+  train_data_sample_num: -1 # Number of sampling prompts for each task, -1 means all data
+  valid_prompt_id: 0 # The prompt used for validation
+  sample_valid: True # Use sampled prompt for validation
+  valid_prompt_sample_num: 2 # The number of sampling validation sequential recommendation prompts
+  use_la: False # Use local attention
+  use_lac: False # Use local attention with constraints
+  add_prompt: False # Add prompt to the input
+
+
+

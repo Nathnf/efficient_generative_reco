@@ -1,0 +1,14 @@
+
+!.gitignore
+
+__pycache__
+cache_models/
+config/
+outputs/
+sandbox/
+
+log/*
+!log/.gitkeep
+
+data/*
+!data/amazon18/.gitkeep

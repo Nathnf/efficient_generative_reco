@@ -69,7 +69,7 @@ This approach was adapted for recommendation in
 
    * Each item is represented by a sequence of discrete tokens (a *Semantic ID*) derived from its text content (title, description, brand, etc.) embedding.
       * A Residual-Quantized VAE (**RQ-VAE**) encodes the item text embedding into a fixed-length token sequence, e.g. `<a_1><b_3><c_8><d_87>`.
-   * Example: with 4 tokens per item and a codebook size of 256 (i.e. each token can take 256 different values), there are `256^4 ≈ 4.3 trillion` possible IDs. Therefore, this configuration can be used for dataset up to 4.3 trillion items.
+   * Example: with 4 tokens per item and a codebook size of 256 (i.e. each token can take 256 different values), there are `256^4 ≈ 4.3 billion` possible IDs. Therefore, this configuration can be used for dataset up to 4.3 billion items.
 
 2. **Generative Retrieval with Semantic IDs**
 
@@ -116,6 +116,7 @@ MQL4GRec builds upon TIGER by incorporating **image information** and addressing
   <img src="./docs/_static/mql4grec_overview.png" alt="MQL4GRec overview" width="900"/>
   <figcaption><em>MQL4GRec model overview (from the original paper).</em></figcaption>
 </figure>
+
 
 **Drawback:**
 Inference is still slow. In our experiments, MQL4GRec was up to **156× slower than SASRec** (a transformer-based discriminative baseline).
@@ -167,6 +168,7 @@ Same as TIGER/MQL4GRec: use an RQ-VAE to map item text (or image) embeddings to 
   <figcaption><em>Parallel TIGER training overview.</em></figcaption>
 </figure>
 
+
 ### Inference
 
 * The model outputs the logits for all token positions in one step.
@@ -181,6 +183,7 @@ Same as TIGER/MQL4GRec: use an RQ-VAE to map item text (or image) embeddings to 
   <figcaption><em>Parallel TIGER training overview (right part of the figure from RecGPT paper).</em></figcaption>
 </figure>
 
+
 **Note:**
 Switching from token-by-token autoregressive decoding (as in TIGER) to parallel generation already reduces inference time, since we only need a single decoder forward pass instead of one per token.
 However, standard trie-based constrained beam search still creates a bottleneck due to nested loops over batch elements and beams.
@@ -189,7 +192,8 @@ To address this, we implemented a fully vectorized beam search that applies cons
 (While this vectorized approach is faster, it consumes more memory than the traditional trie-based method, so its scalability still needs to be evaluated on larger datasets.)
 
 ## 3. Results
-TODO [50x speed up compared to original MQL4GRec - 20% less performance?]
+Preliminary experiments show up to **50× faster generation** compared to MQL4GRec, with **similar or slightly lower accuracy**.
+Detailed benchmarks (Recall\@K, NDCG\@K) will be added soon.
 
 
 ---

@@ -1,5 +1,5 @@
 import datetime
-
+import torch.nn as nn
 import logging
 logger = logging.getLogger(__name__)
 
@@ -7,7 +7,6 @@ logger = logging.getLogger(__name__)
 def get_local_time():
     cur = datetime.datetime.now()
     cur = cur.strftime("%b-%d-%Y_%H-%M-%S")
-
     return cur
 
 
@@ -29,7 +28,7 @@ def log_trainable_parameters(model):
     )
 
 
-def log_embedding_tables(cfg, model, suffix='before', just_head_layer=False):
+def log_embedding_tables(cfg, model, just_head_layer=False):
     """
     Logs the embedding tables of the model.
     Useful to verify that the initialization is correct (no infinite values).
@@ -110,16 +109,16 @@ def log_embedding_tables(cfg, model, suffix='before', just_head_layer=False):
 
     if hasattr(model.t5_model, "lm_heads"):
         for i, head in enumerate(model.t5_model.lm_heads):
-            logger.debug(
-                "decoder lm head {} (shape: {}): {}".format(
-                    i,
-                    head.weight.data.shape,
-                    head.weight.data,
-                )
-            )
-            # # Save tensor
-            # # torch.save(head.weight.data, os.path.join(cfg.output_dir, f"lm_head_{i}_weights.pt"))
-            # torch.save(head.weight.data, os.path.join(f"lm_head_{i}_weights_{suffix}.pt"))
+            for j, layer in enumerate(head.net):
+                if isinstance(layer, nn.Linear):
+                    logger.debug(
+                        "decoder lm head {} layer {} (shape: {}): {}".format(
+                            i,
+                            j,
+                            layer.weight.data.shape,
+                            layer.weight.data,
+                        )
+                    )
     else:
         logger.debug(
             "model.t5_model.lm_head.weight.data (shape: {}): {}".format(

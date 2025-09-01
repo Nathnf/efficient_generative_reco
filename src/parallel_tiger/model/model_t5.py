@@ -4,10 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers import T5Config
+from einops import reduce
 
-from parallel_tiger.model.config import TrainingMode, TrainingConfig, ModelConfig # type: ignore[reportMissingImports]
-from parallel_tiger.model.Q_t5 import QT5                                         # type: ignore[reportMissingImports]
-from parallel_tiger.generation.trie import Trie                                   # type: ignore[reportMissingImports]
+from parallel_tiger.model.config import EncoderAggregation, TrainingMode, TrainingConfig, ModelConfig # type: ignore[reportMissingImports]
+from parallel_tiger.model.Q_t5 import QT5                                                             # type: ignore[reportMissingImports]
+from parallel_tiger.generation.trie import Trie                                                       # type: ignore[reportMissingImports]
 
 import time as time
 from typing import Union, Dict, Tuple, Optional, cast
@@ -84,6 +85,42 @@ class WeightInitializer:
             nn.init.normal_(
                 decoder_cross_attention.codebook_relative_bias_table, mean=0, std=0.02
             )
+
+
+class ItemTokenAggregator:
+    """
+    Aggregates item token embeddings before the encoder.
+    """
+
+    def __init__(self, config: ModelConfig):
+        self.config = config
+
+    def _aggregate_mask_per_item(self, mask: torch.Tensor, bs: int) -> torch.Tensor:
+        mask = mask.view(bs, -1, self.config.n_query)  # (bs, n_items, n_query)
+        mask = mask.all(dim=-1)  # strict version (could also do the mean)
+        return mask
+
+    def aggregate(self, item_embeddings: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # item_embeddings: (bs, n_items * n_query, d_model)
+        bs, _, emb_dim = item_embeddings.shape
+        item_embeddings = item_embeddings.view(bs, -1, self.config.n_query, emb_dim)
+
+        if self.config.encoder_aggregation == EncoderAggregation.SUM.value:
+            item_embeddings = reduce(item_embeddings, 'b i t d -> b i d', 'sum')
+            mask = self._aggregate_mask_per_item(mask, bs)
+
+        elif self.config.encoder_aggregation == EncoderAggregation.MEAN.value:
+            item_embeddings = reduce(item_embeddings, 'b i t d -> b i d', 'mean')
+            mask = self._aggregate_mask_per_item(mask, bs)
+
+        elif self.config.encoder_aggregation == EncoderAggregation.CONCAT.value:
+            raise ValueError("Concatenation not supported yet.")
+            # NOTE: will need to modify the model dimension OR use a projeciton layer.
+            # return item_embeddings.view(item_embeddings.size(0), -1)
+        else:
+            raise ValueError(f"Unknown aggregation method: {self.config.encoder_aggregation}")
+
+        return item_embeddings, mask
 
 
 class LossComputer:
@@ -682,6 +719,7 @@ class T54Rec(nn.Module):
         self.t5_model.config.use_cache = False
 
         # Initialize components
+        self._setup_input_components()
         self._setup_loss_computer()
         if cfg.is_inference:
             self._setup_generation_components()
@@ -713,6 +751,7 @@ class T54Rec(nn.Module):
                 device_map=self.cfg.device_map,
                 n_query=self.cfg.n_query,
                 is_inference=self.cfg.is_inference,
+                is_aggregate_tokens=self.cfg.encoder_aggregation != EncoderAggregation.FLATTEN.value,
                 use_multi_head=self.use_multi_head,
                 has_relative_encoder_item_bias=bias_config.has_relative_encoder_item_bias,
                 has_relative_encoder_codebook_bias=bias_config.has_relative_encoder_codebook_bias,
@@ -732,6 +771,7 @@ class T54Rec(nn.Module):
                 config=t5_config,
                 n_query=self.cfg.n_query,
                 is_inference=self.cfg.is_inference,
+                is_aggregate_tokens=self.cfg.encoder_aggregation != EncoderAggregation.FLATTEN.value,
                 use_multi_head=self.use_multi_head,
                 has_relative_encoder_item_bias=bias_config.has_relative_encoder_item_bias,
                 has_relative_encoder_codebook_bias=bias_config.has_relative_encoder_codebook_bias,
@@ -748,6 +788,10 @@ class T54Rec(nn.Module):
 
         logger.info("T5 model created successfully.")
         return model
+
+    def _setup_input_components(self) -> None:
+        """Initialize input components."""
+        self.encoder_aggregator = ItemTokenAggregator(self.cfg)
 
     def _setup_loss_computer(self) -> None:
         """Initialize loss computation components."""
@@ -847,7 +891,8 @@ class T54Rec(nn.Module):
         )  # (bs, n_query, emb_dim)
 
         # 2. encoder inputs
-        inputs = self.t5_model.shared(input_ids.to(device))  # (bs, seq_len, emb_dim)
+        inputs = self.t5_model.shared(input_ids.to(device))  # (bs, seq_len, emb_dim), seq_len = n_items * n_query
+        inputs, attention_mask = self.encoder_aggregator.aggregate(item_embeddings=inputs, mask=attention_mask)
 
         # 3. decoder inputs
         if decoder_input_tokens is not None and decoder_input_mask is not None:

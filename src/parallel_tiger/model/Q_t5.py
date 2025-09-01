@@ -1,5 +1,22 @@
+import torch
+import torch.nn as nn
+import copy
 from transformers import T5ForConditionalGeneration
-from transformers.models.t5.modeling_t5 import *
+
+from transformers.models.t5.modeling_t5 import (
+    T5Stack,
+    T5LayerNorm,
+    BaseModelOutputWithPastAndCrossAttentions,
+    add_start_docstrings_to_model_forward,
+    T5_INPUTS_DOCSTRING,
+    replace_return_docstrings,
+    Seq2SeqLMOutput,
+    warnings,
+    __HEAD_MASK_WARNING_MSG,
+    BaseModelOutput,
+    CrossEntropyLoss
+)
+from typing import Optional, Tuple, Union
 
 from parallel_tiger.model.custom_attention import QDecoderT5Block, CustomBiasT5Stack
 
@@ -301,6 +318,18 @@ class Qdecoder(T5Stack):
         )
 
 
+class ProjectionMLP(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, bias=False):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=bias),
+            nn.ReLU(),                         # or GELU
+            nn.Linear(hidden_dim, out_dim, bias=bias),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 class QT5(T5ForConditionalGeneration):
     _keys_to_ignore_on_load_missing = [
@@ -324,13 +353,14 @@ class QT5(T5ForConditionalGeneration):
             n_query, 
             code_num=256,
             is_inference=False,
+            is_aggregate_tokens=False,
             use_multi_head=False,
-            has_relative_encoder_item_bias= True,
-            has_relative_encoder_codebook_bias= True,
-            has_relative_decoder_item_bias_sa= True,
-            has_relative_decoder_codebook_bias_sa= False,
-            has_relative_decoder_item_bias_ca= False,
-            has_relative_decoder_codebook_bias_ca= False
+            has_relative_encoder_item_bias=True,
+            has_relative_encoder_codebook_bias=True,
+            has_relative_decoder_item_bias_sa=True,
+            has_relative_decoder_codebook_bias_sa=False,
+            has_relative_decoder_item_bias_ca=False,
+            has_relative_decoder_codebook_bias_ca=False
         ):
         super(T5ForConditionalGeneration, self).__init__(config)
 
@@ -345,12 +375,15 @@ class QT5(T5ForConditionalGeneration):
         encoder_config.is_encoder_decoder = False
         encoder_config.n_query = n_query
 
-        self.encoder = CustomBiasT5Stack(
-            encoder_config,
-            self.shared,
-            has_relative_item_bias=has_relative_encoder_item_bias,
-            has_relative_codebook_bias=has_relative_encoder_codebook_bias,
-        )
+        if is_aggregate_tokens: 
+            self.encoder = T5Stack(encoder_config, self.shared)
+        else:
+            self.encoder = CustomBiasT5Stack(
+                encoder_config,
+                self.shared,
+                has_relative_item_bias=has_relative_encoder_item_bias,
+                has_relative_codebook_bias=has_relative_encoder_codebook_bias,
+            )
 
         # decoder would be different
         self.n_query = n_query
@@ -379,10 +412,7 @@ class QT5(T5ForConditionalGeneration):
 
         # Custom multi projection heads
         if use_multi_head and is_inference:
-            self.lm_heads = nn.ModuleList([
-                nn.Linear(config.d_model, code_num, bias=False)
-                for _ in range(n_query)
-            ])
+            self._create_multi_heads()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -396,31 +426,35 @@ class QT5(T5ForConditionalGeneration):
         logger.debug("self.config.tie_word_embeddings (after): %s", self.config.tie_word_embeddings) 
 
     def _create_multi_heads(self):
+        # self.lm_heads = nn.ModuleList([
+        #     nn.Linear(self.config.d_model, self.code_num, bias=False)
+        #     for _ in range(self.n_query)
+        # ])
         self.lm_heads = nn.ModuleList([
-            nn.Linear(self.config.d_model, self.code_num, bias=False)
+            ProjectionMLP(
+                in_dim=self.config.d_model,
+                hidden_dim=self.config.d_model,   # or smaller, e.g. 256
+                out_dim=self.code_num,
+                bias=False
+            )
             for _ in range(self.n_query)
         ])
 
     def replace_projection_head(self):
-        """
-        Replace the standard lm_head with multiple position-specific heads.
-        This is called after model loading to avoid meta tensor issues.
-        """
-        # Store the original head for weight initialization
         original_head = self.lm_head
-        
-        # Create multiple heads
+
         self._create_multi_heads()
 
-        # Initialize each head from the original head
         with torch.no_grad():
-            logger.debug("original_head.weight.data.std(): %f", original_head.weight.data.std().item())
+            std = original_head.weight.data.std().item()
             for head in self.lm_heads:
-                head.weight.data.normal_(mean=0.0, std=original_head.weight.data.std())
-        
-        # Remove the original head to save memory
+                for layer in head.net:
+                    if isinstance(layer, nn.Linear):
+                        layer.weight.data.normal_(mean=0.0, std=std)
+                        if layer.bias is not None:
+                            layer.bias.zero_()
+
         del self.lm_head
-        
         logger.debug(f"Replaced single lm_head with {self.n_query} heads of size {self.code_num}")
 
     def get_output_embeddings(self):
@@ -429,46 +463,9 @@ class QT5(T5ForConditionalGeneration):
         For compatibility, return the ModuleList containing all heads.
         """
         if hasattr(self, 'lm_heads'):
-            # return self.lm_heads[0]
-            return None # NOTE: SEE IF IT'S BETTER TO DO SO
-        return super().get_output_embeddings() # NOTE: SHOULD I JUST RETURN NONE (or simply not use resize embeddings in finetune_parallel_tiger.py?)
+            return None
+        return super().get_output_embeddings()
 
-    # # NOTE: Can comment this method if we output None will `lm_heads`?! (seems so, at least when tie_encoder_decoder=False, didn't try with True)
-    # def set_output_embeddings(self, new_embeddings):
-    #     """
-    #     Set the output embedding modules.
-
-    #     Will be called after loading the original T5 model, when we resize the embedding layer.
-        
-    #     Args:
-    #         new_embeddings: Should be a ModuleList of Linear layers,
-    #                        one for each query position.
-    #     """
-    #     if hasattr(self, 'lm_heads'):
-    #         if isinstance(new_embeddings, nn.ModuleList):
-    #             if len(new_embeddings) != self.n_query:
-    #                 raise ValueError(
-    #                     f"Expected {self.n_query} output heads, got {len(new_embeddings)}"
-    #                 )
-    #             self.lm_heads = new_embeddings
-    #         elif isinstance(new_embeddings, nn.Linear):
-    #             # Single head provided - create multiple copies
-    #             logger.warning("[WARNING] - Single lm_head provided, creating multiple heads by copying weights.")
-    #             self.lm_heads = nn.ModuleList([
-    #                 nn.Linear(new_embeddings.in_features, self.code_num, bias=False)
-    #                 for _ in range(self.n_query)
-    #             ])
-    #             # NOTE: No, this caused all heads to be initialized the same way...
-    #             # # Copy weights to all heads (truncated to code_num)
-    #             # with torch.no_grad():
-    #             #     for head in self.lm_heads:
-    #             #         head.weight.data.copy_(new_embeddings.weight.data[:self.code_num])
-    #         else:
-    #             raise ValueError(
-    #                 f"Expected ModuleList or Linear for QT5 output embeddings, got {type(new_embeddings)}"
-    #             )
-    #     else:
-    #         super().set_output_embeddings(new_embeddings)
 
     _CONFIG_FOR_DOC = "T5Config"
 
@@ -604,11 +601,10 @@ class QT5(T5ForConditionalGeneration):
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.encoder.first_device)
-            # Handle both single head (default) and multi-head (after replacement) cases
             if hasattr(self, 'lm_heads'):
-                for head in self.lm_heads:
-                    head = head.to(self.encoder.first_device)
-                sequence_output = sequence_output.to(self.lm_heads[0].weight.device)
+                self.lm_heads = self.lm_heads.to(self.encoder.first_device)
+                device = next(self.lm_heads[0].parameters()).device
+                sequence_output = sequence_output.to(device)
             else:
                 self.lm_head = self.lm_head.to(self.encoder.first_device)
                 sequence_output = sequence_output.to(self.lm_head.weight.device)
@@ -625,16 +621,6 @@ class QT5(T5ForConditionalGeneration):
                 self.lm_heads[i](sequence_output[:, i, :]) 
                 for i in range(self.n_query)
             ], dim=1)  # Shape: (batch_size, n_query, code_num)
-            # lm_logits_arr = []
-            # for i in range(self.n_query):
-            #     logger.debug("lm_head[%d] weight norm: %f", i, self.lm_heads[i].weight.data.norm().item())
-            #     lm_logits_i = self.lm_heads[i](sequence_output[:, i, :])
-            #     logger.debug("lm_logits[%d] shape: %s", i, lm_logits_i.shape)
-            #     logger.debug("lm_logits[%d] weight norm: %f", i, self.lm_heads[i].weight.data.norm().item())
-            #     logger.debug("lm_logits[%d]: %s", i, lm_logits_i)
-            #     lm_logits_arr.append(lm_logits_i)
-            # lm_logits = torch.stack(lm_logits_arr, dim=1)  # Shape: (batch_size, n_query, code_num)
-            # logger.debug("lm_logits shape: %s", lm_logits.shape)
         else:
             # Single head case (default)
             lm_logits = self.lm_head(sequence_output)  # (batch_size, seq_length, vocab_size)

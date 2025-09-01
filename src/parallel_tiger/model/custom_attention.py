@@ -1,4 +1,13 @@
-from transformers.models.t5.modeling_t5 import *
+import torch
+import torch.nn as nn
+from transformers.models.t5.modeling_t5 import (
+    T5Config,
+    T5Stack,
+    T5Attention,
+    T5LayerSelfAttention,
+    T5LayerCrossAttention,
+    T5Block
+)
 from typing import Optional
 import logging
 logger = logging.getLogger(__name__)
@@ -393,7 +402,6 @@ class CustomEncoderSelfAttention(CustomT5Attention):
             has_relative_item_bias=has_relative_item_bias,
             has_relative_codebook_bias=has_relative_codebook_bias,
         )
-        # self.n_query = config.n_query
 
     def compute_bias(self, query_length, key_length, device=None):
         return self.bias_computer.compute_encoder_self_attention_bias(
@@ -468,7 +476,6 @@ class CustomDecoderSelfAttention(CustomT5Attention):
             has_relative_item_bias=has_relative_item_bias,
             has_relative_codebook_bias=has_relative_codebook_bias,
         )
-        # self.n_query = config.n_query
 
     def compute_bias(self, query_length, key_length, device=None):
         return self.bias_computer.compute_decoder_self_attention_bias(
@@ -503,7 +510,6 @@ class CustomDecoderCrossAttention(CustomT5Attention):
             has_relative_item_bias=has_relative_item_bias,
             has_relative_codebook_bias=has_relative_codebook_bias,
         )
-        # self.n_query = config.n_query
 
     def compute_bias(self, query_length, key_length, device=None):
         return self.bias_computer.compute_decoder_cross_attention_bias(

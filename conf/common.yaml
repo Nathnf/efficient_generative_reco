@@ -13,10 +13,11 @@ output_dir: "./log/${dataset.name}/${quantizer_type}/parallel_TIGER/${exp_name}"
 has_relative_encoder_item_bias: true
 has_relative_encoder_codebook_bias: true
 has_relative_decoder_item_bias_sa: true
-has_relative_decoder_codebook_bias_sa: false
+has_relative_decoder_codebook_bias_sa: true
 has_relative_decoder_item_bias_ca: false
 has_relative_decoder_codebook_bias_ca: false
 
+encoder_aggregation: "sum" # "flatten" (encoder sees every item token), "sum", "mean", or "concat"
 projection_strategy: "single" # "single" or "multi". multi means multiple projection heads (one per token/query)
 
 dataset: 

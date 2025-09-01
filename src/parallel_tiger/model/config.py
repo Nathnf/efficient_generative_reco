@@ -70,6 +70,11 @@ class ProjectionStrategy(Enum):
     SINGLE = "single"  # Single projection head
     MULTI = "multi"    # Multiple projection heads (one per token/query)
 
+class EncoderAggregation(Enum):
+    FLATTEN = "flatten"         # the encoder sees every item token embedding
+    SUM = "sum"                 # the encoder sees the sum of all item token embeddings
+    MEAN = "mean"               # the encoder sees the mean of all item token embeddings
+    CONCAT = "concat"           # the encoder sees the concatenation of all item token embeddings
 
 @dataclass
 class ModelConfig:
@@ -87,11 +92,13 @@ class ModelConfig:
     generation_mode: str = GenerationMode.PARALLEL_BEAM_SEARCH.value
     mask_token_id: int = 3
     projection_strategy: str = ProjectionStrategy.SINGLE.value
+    encoder_aggregation: str = EncoderAggregation.SUM.value
 
     def __post_init__(self):
         if self.is_inference:
             validate_enum("generation_mode", self.generation_mode, GenerationMode)
         validate_enum("projection_strategy", self.projection_strategy, ProjectionStrategy)
+        validate_enum("encoder_aggregation", self.encoder_aggregation, EncoderAggregation)
         if self.bias_config is None:
             self.bias_config = BiasConfig()
         if self.training_config is None:
@@ -112,6 +119,7 @@ class ModelConfig:
             "generation_mode": self.generation_mode,
             "mask_token_id": self.mask_token_id,
             "projection_strategy": self.projection_strategy,
+            "encoder_aggregation": self.encoder_aggregation,
         }
 
 
@@ -174,6 +182,7 @@ def create_config_from_hydra_cfg(
         training_config=training_config,
         generation_mode=cfg.infer.generation_mode if is_inference else '',
         projection_strategy=cfg.projection_strategy,
+        encoder_aggregation=cfg.encoder_aggregation,
     )
 
     return model_config

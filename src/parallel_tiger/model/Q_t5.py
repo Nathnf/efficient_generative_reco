@@ -19,7 +19,6 @@ from transformers.models.t5.modeling_t5 import (
 from typing import Optional, Tuple, Union
 
 from parallel_tiger.model.custom_attention import QDecoderT5Block, CustomBiasT5Stack
-from parallel_tiger.model.config import EncoderAggregation
 
 import logging
 logger = logging.getLogger(__name__)

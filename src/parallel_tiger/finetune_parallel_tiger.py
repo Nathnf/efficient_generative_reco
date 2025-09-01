@@ -218,7 +218,7 @@ def train(cfg: DictConfig):
     model.t5_model.save_pretrained(cfg.output_dir)
 
     if local_rank == 0:
-        log_embedding_tables(cfg, model, suffix='after')
+        log_embedding_tables(cfg, model)
 
 
 @hydra.main(

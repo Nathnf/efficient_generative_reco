@@ -5,7 +5,7 @@ This module contains all configuration dataclasses used throughout the model,
 providing a centralized and type-safe way to manage model parameters.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List, Union
 from enum import Enum
 
@@ -65,16 +65,13 @@ class GenerationMode(Enum):
     PARALLEL_BEAM_SEARCH = "parallel_beam_search"
     AUTOREGRESSIVE_BEAM_SEARCH = "autoregressive_beam_search"
 
-class ProjectionStrategy(Enum):
-    """Configuration for projection strategies."""
-    SINGLE = "single"  # Single projection head
-    MULTI = "multi"    # Multiple projection heads (one per token/query)
 
 class EncoderAggregation(Enum):
     FLATTEN = "flatten"         # the encoder sees every item token embedding
     SUM = "sum"                 # the encoder sees the sum of all item token embeddings
     MEAN = "mean"               # the encoder sees the mean of all item token embeddings
     CONCAT = "concat"           # the encoder sees the concatenation of all item token embeddings
+
 
 @dataclass
 class ModelConfig:
@@ -91,18 +88,19 @@ class ModelConfig:
     training_config: Optional[TrainingConfig] = None
     generation_mode: str = GenerationMode.PARALLEL_BEAM_SEARCH.value
     mask_token_id: int = 3
-    projection_strategy: str = ProjectionStrategy.SINGLE.value
+    use_multi_head: bool = False
     encoder_aggregation: str = EncoderAggregation.SUM.value
+    is_aggregate_tokens: bool = field(init=False)
 
     def __post_init__(self):
         if self.is_inference:
             validate_enum("generation_mode", self.generation_mode, GenerationMode)
-        validate_enum("projection_strategy", self.projection_strategy, ProjectionStrategy)
         validate_enum("encoder_aggregation", self.encoder_aggregation, EncoderAggregation)
         if self.bias_config is None:
             self.bias_config = BiasConfig()
         if self.training_config is None:
             self.training_config = TrainingConfig()
+        self.is_aggregate_tokens = self.encoder_aggregation != EncoderAggregation.FLATTEN.value
 
     def to_dict(self):
         return {
@@ -118,8 +116,9 @@ class ModelConfig:
             "training_config": self.training_config,
             "generation_mode": self.generation_mode,
             "mask_token_id": self.mask_token_id,
-            "projection_strategy": self.projection_strategy,
+            "use_multi_head": self.use_multi_head,
             "encoder_aggregation": self.encoder_aggregation,
+            "is_aggregate_tokens": self.is_aggregate_tokens,
         }
 
 
@@ -181,7 +180,7 @@ def create_config_from_hydra_cfg(
         bias_config=bias_config,
         training_config=training_config,
         generation_mode=cfg.infer.generation_mode if is_inference else '',
-        projection_strategy=cfg.projection_strategy,
+        use_multi_head=cfg.use_multi_head,
         encoder_aggregation=cfg.encoder_aggregation,
     )
 

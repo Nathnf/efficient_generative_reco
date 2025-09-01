@@ -30,7 +30,8 @@ class WeightInitializer:
         logger.info("Initializing weights with normal distribution...")
 
         self._initialize_query_embeddings()
-        self._initialize_encoder_biases()
+        if not self.config.is_aggregate_tokens:
+            self._initialize_encoder_biases()
         self._initialize_decoder_biases()
 
     def _initialize_query_embeddings(self) -> None:
@@ -711,15 +712,15 @@ class T54Rec(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super(T54Rec, self).__init__()
         self.cfg = cfg  # `cfg` and not `config` because the latter is used in the transformers library
-        self.use_multi_head = self.cfg.projection_strategy == "multi"
 
         logger.info(f"Initializing language decoder ...")
+        # Initialize item aggregator
+        self._setup_input_components()
         # Initialize core model
         self.t5_model = self._create_t5_model()
         self.t5_model.config.use_cache = False
 
         # Initialize components
-        self._setup_input_components()
         self._setup_loss_computer()
         if cfg.is_inference:
             self._setup_generation_components()
@@ -732,15 +733,18 @@ class T54Rec(nn.Module):
 
         logger.info("Language decoder initialized.")
 
+    def _setup_input_components(self) -> None:
+        """Initialize input components."""
+        self.encoder_aggregator = ItemTokenAggregator(self.cfg)
+        if self.cfg.is_aggregate_tokens:
+            assert not (self.cfg.bias_config.has_relative_encoder_item_bias or self.cfg.bias_config.has_relative_encoder_codebook_bias)
+
     def _create_t5_model(self) -> QT5:
         """
         Create the T5 model with the specified configuration.
         TODO: Explain that for multi-head projection, we need to load a T5 model and then replace the projection head.
         At inference, we simply load the QT5 model (with multi-head projection already in place).
         """
-        bias_config = self.cfg.bias_config
-        assert bias_config, "Bias configuration is missing."  # to pass pylance checks
-
         if self.cfg.is_pretrained_model:
             # For inference or finetuning with SETRec config
             logger.info("Loading pretrained T5 model...")
@@ -749,16 +753,7 @@ class T54Rec(nn.Module):
                 local_files_only=True,
                 cache_dir=self.cfg.cache_dir,
                 device_map=self.cfg.device_map,
-                n_query=self.cfg.n_query,
-                is_inference=self.cfg.is_inference,
-                is_aggregate_tokens=self.cfg.encoder_aggregation != EncoderAggregation.FLATTEN.value,
-                use_multi_head=self.use_multi_head,
-                has_relative_encoder_item_bias=bias_config.has_relative_encoder_item_bias,
-                has_relative_encoder_codebook_bias=bias_config.has_relative_encoder_codebook_bias,
-                has_relative_decoder_item_bias_sa=bias_config.has_relative_decoder_item_bias_sa,
-                has_relative_decoder_codebook_bias_sa=bias_config.has_relative_decoder_codebook_bias_sa,
-                has_relative_decoder_item_bias_ca=bias_config.has_relative_decoder_item_bias_ca,
-                has_relative_decoder_codebook_bias_ca=bias_config.has_relative_decoder_codebook_bias_ca,
+                cfg=self.cfg,
             )
             model = cast(QT5, model)
 
@@ -768,37 +763,24 @@ class T54Rec(nn.Module):
             config_path = os.path.join(self.cfg.cache_dir, "config.json")
             t5_config = T5Config.from_json_file(config_path)
             model = QT5(
-                config=t5_config,
-                n_query=self.cfg.n_query,
-                is_inference=self.cfg.is_inference,
-                is_aggregate_tokens=self.cfg.encoder_aggregation != EncoderAggregation.FLATTEN.value,
-                use_multi_head=self.use_multi_head,
-                has_relative_encoder_item_bias=bias_config.has_relative_encoder_item_bias,
-                has_relative_encoder_codebook_bias=bias_config.has_relative_encoder_codebook_bias,
-                has_relative_decoder_item_bias_sa=bias_config.has_relative_decoder_item_bias_sa,
-                has_relative_decoder_codebook_bias_sa=bias_config.has_relative_decoder_codebook_bias_sa,
-                has_relative_decoder_item_bias_ca=bias_config.has_relative_decoder_item_bias_ca,
-                has_relative_decoder_codebook_bias_ca=bias_config.has_relative_decoder_codebook_bias_ca,
+                t5_config=t5_config,
+                cfg=self.cfg,
             )
 
         # Replace single head with multiple heads after successful loading
-        if self.use_multi_head and not self.cfg.is_inference:
+        if self.cfg.use_multi_head and not self.cfg.is_inference:
             logger.info("Replacing single projection head with multiple heads.")
             model.replace_projection_head()
 
         logger.info("T5 model created successfully.")
         return model
 
-    def _setup_input_components(self) -> None:
-        """Initialize input components."""
-        self.encoder_aggregator = ItemTokenAggregator(self.cfg)
-
     def _setup_loss_computer(self) -> None:
         """Initialize loss computation components."""
         device = next(self.t5_model.parameters()).device
         training_config = self.cfg.training_config
         assert training_config is not None, "Training configuration must be provided."
-        self.loss_computer = LossComputer(training_config, device, use_multi_head=self.use_multi_head)
+        self.loss_computer = LossComputer(training_config, device, use_multi_head=self.cfg.use_multi_head)
 
     def _setup_generation_components(self) -> None:
         """Initialize generation-specific components."""
@@ -806,10 +788,10 @@ class T54Rec(nn.Module):
         logger.info(f"Using generation mode: {generation_mode}")
 
         if generation_mode == 'parallel_beam_search':
-            self.generator = ParallelBeamSearchGenerator(self, use_multi_head=self.use_multi_head)
+            self.generator = ParallelBeamSearchGenerator(self, use_multi_head=self.cfg.use_multi_head)
         elif generation_mode == 'autoregressive_beam_search':
             mask_token_id = getattr(self.cfg, 'mask_token_id', 3)
-            self.generator = AutoregressiveGenerator(self, use_multi_head=self.use_multi_head, mask_token_id=mask_token_id)
+            self.generator = AutoregressiveGenerator(self, use_multi_head=self.cfg.use_multi_head, mask_token_id=mask_token_id)
         else:
             raise ValueError(f"Unknown generation mode: {generation_mode}")
         

@@ -19,6 +19,7 @@ from transformers.models.t5.modeling_t5 import (
 from typing import Optional, Tuple, Union
 
 from parallel_tiger.model.custom_attention import QDecoderT5Block, CustomBiasT5Stack
+from parallel_tiger.model.config import EncoderAggregation
 
 import logging
 logger = logging.getLogger(__name__)
@@ -349,58 +350,53 @@ class QT5(T5ForConditionalGeneration):
 
     def __init__(
             self, 
-            config, 
-            n_query, 
-            code_num=256,
-            is_inference=False,
-            is_aggregate_tokens=False,
-            use_multi_head=False,
-            has_relative_encoder_item_bias=True,
-            has_relative_encoder_codebook_bias=True,
-            has_relative_decoder_item_bias_sa=True,
-            has_relative_decoder_codebook_bias_sa=False,
-            has_relative_decoder_item_bias_ca=False,
-            has_relative_decoder_codebook_bias_ca=False
+            t5_config, 
+            cfg,
         ):
-        super(T5ForConditionalGeneration, self).__init__(config)
+        super(T5ForConditionalGeneration, self).__init__(t5_config)
+        self.t5_config = t5_config
+        self.model_dim = t5_config.d_model
+        n_query = cfg.n_query
+        code_num = cfg.code_num
+        is_inference = cfg.is_inference
+        use_multi_head = cfg.use_multi_head
+        bias_config = cfg.bias_config
 
-        self.model_dim = config.d_model
-
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = nn.Embedding(t5_config.vocab_size, t5_config.d_model)
 
         # encoder should be the same as T5
-        encoder_config = copy.deepcopy(config)
+        encoder_config = copy.deepcopy(t5_config)
         encoder_config.is_decoder = False
         encoder_config.use_cache = False
         encoder_config.is_encoder_decoder = False
         encoder_config.n_query = n_query
 
-        if is_aggregate_tokens: 
+        if cfg.is_aggregate_tokens: 
             self.encoder = T5Stack(encoder_config, self.shared)
         else:
             self.encoder = CustomBiasT5Stack(
                 encoder_config,
                 self.shared,
-                has_relative_item_bias=has_relative_encoder_item_bias,
-                has_relative_codebook_bias=has_relative_encoder_codebook_bias,
+                has_relative_item_bias=bias_config.has_relative_encoder_item_bias,
+                has_relative_codebook_bias=bias_config.has_relative_encoder_codebook_bias,
             )
 
         # decoder would be different
         self.n_query = n_query
-        decoder_config = copy.deepcopy(config)
+        decoder_config = copy.deepcopy(t5_config)
         decoder_config.is_decoder = True
         decoder_config.is_encoder_decoder = False
-        decoder_config.num_layers = config.num_decoder_layers
+        decoder_config.num_layers = t5_config.num_decoder_layers
         decoder_config.n_query = n_query
 
         self.decoder = Qdecoder(
             decoder_config,
             self.shared,
             self.n_query,
-            has_relative_item_bias_sa=has_relative_decoder_item_bias_sa,
-            has_relative_codebook_bias_sa=has_relative_decoder_codebook_bias_sa,
-            has_relative_item_bias_ca=has_relative_decoder_item_bias_ca,
-            has_relative_codebook_bias_ca=has_relative_decoder_codebook_bias_ca,
+            has_relative_item_bias_sa=bias_config.has_relative_decoder_item_bias_sa,
+            has_relative_codebook_bias_sa=bias_config.has_relative_decoder_codebook_bias_sa,
+            has_relative_item_bias_ca=bias_config.has_relative_decoder_item_bias_ca,
+            has_relative_codebook_bias_ca=bias_config.has_relative_decoder_codebook_bias_ca,
         )
 
         # Store parameters for potential head replacement
@@ -408,7 +404,7 @@ class QT5(T5ForConditionalGeneration):
         self.code_num = code_num
         
         # Create standard lm_head
-        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(t5_config.d_model, t5_config.vocab_size, bias=False)
 
         # Custom multi projection heads
         if use_multi_head and is_inference:
@@ -421,9 +417,9 @@ class QT5(T5ForConditionalGeneration):
         self.model_parallel = False
         self.device_map = None
 
-        logger.debug("self.config.tie_word_embeddings: %s", self.config.tie_word_embeddings)
-        self.config.tie_word_embeddings = False
-        logger.debug("self.config.tie_word_embeddings (after): %s", self.config.tie_word_embeddings) 
+        logger.debug("self.t5_config.tie_word_embeddings: %s", self.t5_config.tie_word_embeddings)
+        self.t5_config.tie_word_embeddings = False
+        logger.debug("self.t5_config.tie_word_embeddings (after): %s", self.t5_config.tie_word_embeddings)
 
     def _create_multi_heads(self):
         # self.lm_heads = nn.ModuleList([
@@ -432,8 +428,8 @@ class QT5(T5ForConditionalGeneration):
         # ])
         self.lm_heads = nn.ModuleList([
             ProjectionMLP(
-                in_dim=self.config.d_model,
-                hidden_dim=self.config.d_model,   # or smaller, e.g. 256
+                in_dim=self.t5_config.d_model,
+                hidden_dim=self.t5_config.d_model,   # or smaller, e.g. 256
                 out_dim=self.code_num,
                 bias=False
             )
@@ -523,14 +519,14 @@ class QT5(T5ForConditionalGeneration):
         >>> print(tokenizer.decode(outputs[0], skip_special_tokens=True))
         >>> # studies have shown that owning a dog is good for you.
         ```"""
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        use_cache = use_cache if use_cache is not None else self.t5_config.use_cache
         return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
+            return_dict if return_dict is not None else self.t5_config.use_return_dict
         )
 
         # FutureWarning: head_mask was separated into two input args - head_mask, decoder_head_mask
         if head_mask is not None and decoder_head_mask is None:
-            if self.config.num_layers == self.config.num_decoder_layers:
+            if self.t5_config.num_layers == self.t5_config.num_decoder_layers:
                 warnings.warn(__HEAD_MASK_WARNING_MSG, FutureWarning)
                 decoder_head_mask = head_mask
 
@@ -609,7 +605,7 @@ class QT5(T5ForConditionalGeneration):
                 self.lm_head = self.lm_head.to(self.encoder.first_device)
                 sequence_output = sequence_output.to(self.lm_head.weight.device)
 
-        if self.config.tie_word_embeddings:
+        if self.t5_config.tie_word_embeddings:
             # Rescale output before projecting on vocab
             # See https://github.com/tensorflow/mesh/blob/fa19d69eafc9a482aff0b59ddd96b025c0cb207d/mesh_tensorflow/transformer/transformer.py#L586
             sequence_output = sequence_output * (self.model_dim**-0.5)

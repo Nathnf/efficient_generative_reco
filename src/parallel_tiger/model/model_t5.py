@@ -357,6 +357,7 @@ def _get_valid_mask(
     t: int,
     beam_tokens: torch.Tensor,
     transition_masks: Dict,
+    transition_mask_t3_full: Optional[torch.Tensor],
     prefix_to_uidx_t3: Optional[torch.Tensor],
     uidx_to_next_tokens_t3: Optional[torch.Tensor],
     trie: Optional[Trie],
@@ -380,6 +381,10 @@ def _get_valid_mask(
             # mask: (codebook_num, codebook_num, codebook_num) # NOTE: PUT IT INSIDE DOCSTRING?
             # beam_tokens[:, :, :2] -> (bs, k, 2)              # NOTE: PUT IT INSIDE DOCSTRING?
             return mask[beam_tokens[:, :, 0], beam_tokens[:, :, 1]] # (bs, k, codebook_num)
+
+    # NOTE: Takes longer but correct
+    elif t == 3 and transition_mask_t3_full is not None:
+        return transition_mask_t3_full[beam_tokens[:, :, 0], beam_tokens[:, :, 1], beam_tokens[:, :, 2]] # (bs, k, codebook_num)
 
     elif (t == 3 and prefix_to_uidx_t3 is not None and
           uidx_to_next_tokens_t3 is not None):
@@ -470,7 +475,7 @@ class CustomGeneration:
         no_special_tokenizer_tokens = self.model.cfg.special_tokenizer_tokens_num
         return bs, n_query, device, code_num, no_special_tokenizer_tokens
 
-    def _get_constraints(self, use_constraints: bool, device: torch.device, code_num: int) -> Tuple[torch.Tensor, dict[int, torch.Tensor] | dict[int, None]]:
+    def _get_constraints(self, use_constraints: bool, device: torch.device, code_num: int) -> Tuple[torch.Tensor, dict[int, torch.Tensor] | dict[int, None], torch.Tensor | None]:
         """Get first token and transition constraints."""
         if use_constraints:
             assert self.model.first_token_constraints_fast is not None, \
@@ -481,11 +486,13 @@ class CustomGeneration:
             first_token_constraints = self.model.first_token_constraints_fast
             transition_masks = self.model.transition_constraints_fast
             transition_masks = {t: mask.to_dense() for t, mask in transition_masks.items() if mask is not None}
+            transition_mask_t3_full = self.model.transition_mask_t3_full.to(device)
         else:
             first_token_constraints = torch.ones(code_num, dtype=torch.bool, device=device)
             transition_masks = {1: None, 2: None}
-        
-        return first_token_constraints, transition_masks
+            transition_mask_t3_full = None
+
+        return first_token_constraints, transition_masks, transition_mask_t3_full
 
     def _initialize_beams(self, log_probs: torch.Tensor, first_token_constraints: torch.Tensor, 
                          no_special_tokenizer_tokens: int, code_num: int, topK: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -502,19 +509,19 @@ class CustomGeneration:
 
     def _initialize_generation(
         self, log_probs: torch.Tensor, use_constraints: bool, topK: int
-    ) -> Tuple[int, int, torch.device, int, int, dict[int, torch.Tensor] | dict[int, None], torch.Tensor, torch.Tensor]:
+    ) -> Tuple[int, int, torch.device, int, int, dict[int, torch.Tensor] | dict[int, None], torch.Tensor | None, torch.Tensor, torch.Tensor]:
         # Get model properties
         bs, n_query, device, code_num, no_special_tokenizer_tokens = self._get_model_properties(log_probs)
         
         # Prepare transition masks
-        first_token_constraints, transition_masks = self._get_constraints(use_constraints, device, code_num)
+        first_token_constraints, transition_masks, transition_mask_t3_full = self._get_constraints(use_constraints, device, code_num)
 
         # First token
         beam_tokens, beam_scores = self._initialize_beams(
             log_probs, first_token_constraints, no_special_tokenizer_tokens, code_num, topK
         )
         return (bs, n_query, device, code_num, no_special_tokenizer_tokens, 
-                transition_masks, beam_tokens, beam_scores)
+                transition_masks, transition_mask_t3_full, beam_tokens, beam_scores)
     
     def _add_token_offsets(self, beam_tokens: torch.Tensor, n_query: int, 
                           no_special_tokenizer_tokens: int, code_num: int):
@@ -551,13 +558,21 @@ class ParallelBeamSearchGenerator(CustomGeneration):
             Dictionary with 'sequences' and 'sequences_scores' keys
         """
         # Get model predictions
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
         _, logits = self.model.predict(input_ids, attention_mask)
         log_probs = F.log_softmax(logits, dim=-1)  # (bs, n_query, vocab_size)
         # logger.debug(f"log_probs shape: {log_probs.shape}")
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        torch.cuda.synchronize()
+        logger.debug(f"predict time: {start.elapsed_time(end)} ms")
 
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
         # Initialize generation (first step)
         (bs, n_query, device, code_num, no_special_tokenizer_tokens,
-         transition_masks, beam_tokens, beam_scores) = self._initialize_generation(
+         transition_masks, transition_mask_t3_full, beam_tokens, beam_scores) = self._initialize_generation(
             log_probs, use_constraints, topK
         )
 
@@ -573,10 +588,13 @@ class ParallelBeamSearchGenerator(CustomGeneration):
             # logger.debug(f"t: {t}, current_log_probs shape: {current_log_probs.shape}")
 
             # Get valid token mask
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
             valid_mask = _get_valid_mask(
                 t=t,
                 beam_tokens=beam_tokens,
                 transition_masks=transition_masks,
+                transition_mask_t3_full=transition_mask_t3_full if use_constraints else None,
                 prefix_to_uidx_t3=self.model.prefix_to_uidx_t3 if use_constraints else None,
                 uidx_to_next_tokens_t3=self.model.uidx_to_next_tokens_t3 if use_constraints else None,
                 trie=self.model.candidate_trie if use_constraints else None,
@@ -586,9 +604,15 @@ class ParallelBeamSearchGenerator(CustomGeneration):
                 no_special_tokenizer_tokens=no_special_tokenizer_tokens,
                 device=device
             )
-            
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            torch.cuda.synchronize()
+            logger.debug(f"t: {t}, valid_mask time: {start.elapsed_time(end)} ms")
+
             # Update beams
             # logger.debug(f"t: {t}, valid_mask shape: {valid_mask.shape}")
+            start = torch.cuda.Event(enable_timing=True)
+            start.record()
             beam_tokens, beam_scores = _update_beams(
                 current_log_probs_extended=current_log_probs[:, None, :],
                 valid_mask=valid_mask,
@@ -596,11 +620,19 @@ class ParallelBeamSearchGenerator(CustomGeneration):
                 beam_scores=beam_scores,
                 k=topK
             )
-        
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            torch.cuda.synchronize()
+            logger.debug(f"t: {t}, update_beams time: {start.elapsed_time(end)} ms")
+
         # Add offset for special tokens and codebook tokens
         beam_tokens = self._add_token_offsets(
             beam_tokens, n_query, no_special_tokenizer_tokens, code_num
         )
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        torch.cuda.synchronize()
+        logger.debug(f"beam search time: {start.elapsed_time(end)} ms")
         
         return {"sequences": beam_tokens, "sequences_scores": beam_scores}
     
@@ -636,7 +668,7 @@ class AutoregressiveGenerator(CustomGeneration):
 
         # Initialize generation (first step)
         (bs, n_query, device, code_num, no_special_tokenizer_tokens,
-         transition_masks, beam_tokens, beam_scores) = self._initialize_generation(
+         transition_masks, transition_mask_t3_full, beam_tokens, beam_scores) = self._initialize_generation(
             log_probs, use_constraints, topK
         )
 
@@ -680,6 +712,7 @@ class AutoregressiveGenerator(CustomGeneration):
                 t=t,
                 beam_tokens=beam_tokens,
                 transition_masks=transition_masks,
+                transition_mask_t3_full=transition_mask_t3_full,
                 prefix_to_uidx_t3=self.model.prefix_to_uidx_t3 if use_constraints else None,
                 uidx_to_next_tokens_t3=self.model.uidx_to_next_tokens_t3 if use_constraints else None,
                 trie=self.model.candidate_trie if use_constraints else None,
@@ -825,6 +858,16 @@ class T54Rec(nn.Module):
             1: transition_mask_t1.to(dtype=torch.bool, device=self.t5_model.device),
             2: transition_mask_t2.to(dtype=torch.bool, device=self.t5_model.device),
         }
+    
+    def set_transition_constraints_t3_full(
+        self, transition_mask_t3: torch.Tensor
+    ) -> None:
+        """
+        Set the transition constraints for the model.
+        # :param transition_mask_t1: (vocab_size, vocab_size) boolean tensor indicating valid transitions for the first token
+        # :param transition_mask_t2: (vocab_size, vocab_size) boolean tensor indicating valid transitions for the second token
+        """
+        self.transition_mask_t3_full = transition_mask_t3
 
     def set_transition_constraints_fast_t3(
         self, prefix_to_uidx_t3: torch.Tensor, uidx_to_next_tokens_t3: torch.Tensor

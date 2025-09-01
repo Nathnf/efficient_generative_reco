@@ -141,6 +141,7 @@ def test_ddp(cfg: DictConfig):
         transition_mask_t2,
         prefix_to_uidx_t3,
         uidx_to_next_tokens_t3,
+        transition_mask_t3,
     ) = compute_or_load_transition_constraints_codebook_fast(
         cfg=cfg,
         tokenizer=tokenizer,
@@ -148,6 +149,7 @@ def test_ddp(cfg: DictConfig):
         first_token_constraints_path=cfg.infer.first_token_constraints_path,
         transition_constraints_t1_path=cfg.infer.transition_constraints_t1_path,
         transition_constraints_t2_path=cfg.infer.transition_constraints_t2_path,
+        transition_constraints_t3_path=cfg.infer.transition_constraints_t3_path,
         prefix_to_uidx_t3_path=cfg.infer.prefix_to_uidx_t3_path,
         uidx_to_next_tokens_t3_path=cfg.infer.uidx_to_next_tokens_t3_path,
         num_special_tokenizer_tokens=special_tokenizer_tokens_num,
@@ -155,6 +157,7 @@ def test_ddp(cfg: DictConfig):
     model.set_first_token_constraints_fast(first_token_constraints_fast)
     model.set_transition_constraints_fast(transition_mask_t1, transition_mask_t2)
     model.set_transition_constraints_fast_t3(prefix_to_uidx_t3, uidx_to_next_tokens_t3)
+    model.set_transition_constraints_t3_full(transition_mask_t3)
 
     logger.info("Model device: {}".format(model.t5_model.device))
     ddp_sampler = DistributedSampler(

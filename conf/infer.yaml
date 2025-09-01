@@ -13,6 +13,7 @@ infer:
   first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"
   transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}.pt"
   transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t3_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t3_codenum${code_num}_${quantizer_type}.pt"
   prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
   uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
 

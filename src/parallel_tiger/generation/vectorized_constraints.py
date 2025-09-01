@@ -29,10 +29,12 @@ def compute_or_load_transition_constraints_codebook_fast(
     first_token_constraints_path: Optional[str] = None,
     transition_constraints_t1_path: Optional[str] = None,
     transition_constraints_t2_path: Optional[str] = None,
+    transition_constraints_t3_path: Optional[str] = None,
     prefix_to_uidx_t3_path: Optional[str] = None,
     uidx_to_next_tokens_t3_path: Optional[str] = None,
     num_special_tokenizer_tokens: int = 4,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute or load codebook-aware transition constraints for sequence generation.
 
@@ -141,6 +143,8 @@ def compute_or_load_transition_constraints_codebook_fast(
         and os.path.exists(prefix_to_uidx_t3_path)
         and uidx_to_next_tokens_t3_path
         and os.path.exists(uidx_to_next_tokens_t3_path)
+        and transition_constraints_t3_path
+        and os.path.exists(transition_constraints_t3_path)
     ):
         logger.info("Loading precomputed constraints...")
         first_token_constraints = torch.load(first_token_constraints_path)
@@ -148,6 +152,7 @@ def compute_or_load_transition_constraints_codebook_fast(
         transition_mask_t2 = torch.load(transition_constraints_t2_path)
         prefix_to_uidx_t3 = torch.load(prefix_to_uidx_t3_path)
         uidx_to_next_tokens_t3 = torch.load(uidx_to_next_tokens_t3_path)
+        transition_mask_t3 = torch.load(transition_constraints_t3_path)
 
         logger.info("Total unique 3-token prefixes (|U|): {}".format(uidx_to_next_tokens_t3.shape[0]))
         total_size_bytes = (
@@ -164,6 +169,7 @@ def compute_or_load_transition_constraints_codebook_fast(
             transition_mask_t2,
             prefix_to_uidx_t3,
             uidx_to_next_tokens_t3,
+            transition_mask_t3,
         )
 
     # Initialize masks t0, t1 and t2 masks
@@ -171,6 +177,9 @@ def compute_or_load_transition_constraints_codebook_fast(
     transition_mask_t1 = torch.zeros(codebook_size, codebook_size, dtype=torch.bool)
     transition_mask_t2 = torch.zeros(
         codebook_size, codebook_size, codebook_size, dtype=torch.bool
+    )
+    transition_mask_t3 = torch.zeros(
+        codebook_size, codebook_size, codebook_size, codebook_size, dtype=torch.bool
     )
 
     # Initialize objects for t3 transitions
@@ -215,6 +224,9 @@ def compute_or_load_transition_constraints_codebook_fast(
             tokens_to_indices[item_tokens[3]] - num_special_tokenizer_tokens
         ) % codebook_size
 
+        # t=3 full mask logic
+        transition_mask_t3[idx0, idx1, idx2, idx3] = True
+
         prefix = (idx0, idx1, idx2)
 
         if prefix not in prefix_to_uidx_dict:
@@ -248,6 +260,8 @@ def compute_or_load_transition_constraints_codebook_fast(
         torch.save(prefix_to_uidx, prefix_to_uidx_t3_path)
     if uidx_to_next_tokens_t3_path:
         torch.save(uidx_to_next_tokens, uidx_to_next_tokens_t3_path)
+    if transition_constraints_t3_path:
+        torch.save(transition_mask_t3, transition_constraints_t3_path)
 
     return (
         first_token_constraints,
@@ -255,4 +269,5 @@ def compute_or_load_transition_constraints_codebook_fast(
         transition_mask_t2,
         prefix_to_uidx,
         uidx_to_next_tokens,
+        transition_mask_t3,
     )

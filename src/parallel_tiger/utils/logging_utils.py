@@ -40,7 +40,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                 model.t5_model.decoder.query_emb.weight.data,
             )
         )
-        if cfg.has_relative_encoder_item_bias:
+        if cfg.model.has_relative_encoder_item_bias:
             logger.debug(
                 "encoder item bias table (shape: {}): {}".format(
                     model.t5_model.encoder.block[0]
@@ -51,7 +51,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                     .SelfAttention.relative_item_bias.weight.data,
                 )
             )
-        if cfg.has_relative_encoder_codebook_bias:
+        if cfg.model.has_relative_encoder_codebook_bias:
             logger.debug(
                 "encoder codebook bias table (shape: {}): {}".format(
                     model.t5_model.encoder.block[0]
@@ -62,7 +62,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                     .SelfAttention.codebook_relative_bias_table,
                 )
             )
-        if cfg.has_relative_decoder_item_bias_sa:
+        if cfg.model.has_relative_decoder_item_bias_sa:
             logger.debug(
                 "decoder item bias table (self-attention) (shape: {}): {}".format(
                     model.t5_model.decoder.block[0]
@@ -73,7 +73,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                     .SelfAttention.relative_item_bias.weight.data,
                 )
             )
-        if cfg.has_relative_decoder_codebook_bias_sa:
+        if cfg.model.has_relative_decoder_codebook_bias_sa:
             logger.debug(
                 "decoder codebook bias table (self-attention) (shape: {}): {}".format(
                     model.t5_model.decoder.block[0]
@@ -84,7 +84,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                     .SelfAttention.codebook_relative_bias_table,
                 )
             )
-        if cfg.has_relative_decoder_item_bias_ca:
+        if cfg.model.has_relative_decoder_item_bias_ca:
             logger.debug(
                 "decoder item bias table (cross-attention) (shape: {}): {}".format(
                     model.t5_model.decoder.block[0]
@@ -95,7 +95,7 @@ def log_embedding_tables(cfg, model, just_head_layer=False):
                     .EncDecAttention.relative_item_bias.weight.data,
                 )
             )
-        if cfg.has_relative_decoder_codebook_bias_ca:
+        if cfg.model.has_relative_decoder_codebook_bias_ca:
             logger.debug(
                 "decoder codebook bias table (cross-attention) (shape: {}): {}".format(
                     model.t5_model.decoder.block[0]

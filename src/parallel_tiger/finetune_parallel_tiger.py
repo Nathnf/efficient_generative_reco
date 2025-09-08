@@ -17,7 +17,7 @@ from transformers.integrations.integration_utils import ClearMLCallback
 
 from parallel_tiger.model.model_t5 import T54Rec
 from parallel_tiger.model.config import (
-    create_config_from_hydra_cfg
+    create_train_config_from_hydra_cfg
 )
 from parallel_tiger.utils.misc import (
     set_seed,
@@ -114,13 +114,13 @@ def train(cfg: DictConfig):
     tokenizer.padding_side = "left"
 
     cfg.base_model = (
-        cfg.load_model_name if cfg.load_model_name is not None else cfg.base_model
+        cfg.load_model_name if cfg.get("load_model_name") and
+        cfg.load_model_name is not None else cfg.base_model
     )
 
-    model_config = create_config_from_hydra_cfg(
+    model_config = create_train_config_from_hydra_cfg(
         cfg,
-        is_inference=False,
-        is_pretrained_model=True,
+        is_pretrained_model=cfg.train.is_pretrained_model,
         device_map=device_map,
         tokenizer_special_tokens_num=len(tokenizer.special_tokens_map),
     )
@@ -140,8 +140,9 @@ def train(cfg: DictConfig):
         tokenizer
     )
 
-    model.t5_model.resize_token_embeddings(len(tokenizer))
-    model.t5_model.config.vocab_size = len(tokenizer)
+    if model_config.is_pretrained_model:
+        model.t5_model.resize_token_embeddings(len(tokenizer))
+        model.t5_model.config.vocab_size = len(tokenizer)
 
     if local_rank == 0:
         log_embedding_tables(cfg, model, just_head_layer=True)
@@ -196,6 +197,8 @@ def train(cfg: DictConfig):
             logging_steps=cfg.train.logging_step, # will be used only if `cfg.train.save_and_eval_strategy == "steps"`
             eval_steps=cfg.train.save_and_eval_steps, # idem
             save_steps=cfg.train.save_and_eval_steps, # idem
+            max_steps=cfg.train.max_steps,
+            warmup_steps=cfg.train.warmup_steps,
             output_dir=cfg.output_dir,
             save_total_limit=1,
             load_best_model_at_end=True,
@@ -206,7 +209,7 @@ def train(cfg: DictConfig):
             report_to=None,
             eval_delay=1 if cfg.train.save_and_eval_strategy == "epoch" else 2*cfg.train.logging_step,
         ),
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics if cfg.train.val_set_size > 0 and cfg.train.log_codebook_losses else None,
         data_collator=collator,
         callbacks=callbacks,
     )
@@ -215,10 +218,18 @@ def train(cfg: DictConfig):
     trainer.train(
         resume_from_checkpoint=cfg.train.resume_from_checkpoint,
     )
-    model.t5_model.save_pretrained(cfg.output_dir)
+    model.t5_model.save_pretrained(
+        cfg.output_dir, 
+        is_main_process=(local_rank == 0),
+        safe_serialization=False, # if encountering problem with loading `lm_head` after training, disable safe_serialization. However, the issue should be fixed inside Q_t5 init method.
+    )
 
     if local_rank == 0:
+        # model.cfg.save(cfg.output_dir)
+        model_config.save(cfg.output_dir)
+        logger.debug("model.t5_model.state_dict(): {}".format(model.t5_model.state_dict()))
         log_embedding_tables(cfg, model)
+
 
 
 @hydra.main(

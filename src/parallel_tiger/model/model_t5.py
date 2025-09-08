@@ -12,6 +12,7 @@ from parallel_tiger.generation.trie import Trie                                 
 
 import time as time
 from typing import Union, Dict, Tuple, Optional, cast
+# from omegaconf import OmegaConf
 
 import logging
 
@@ -371,14 +372,14 @@ def _get_valid_mask(
     if t in transition_masks and transition_masks[t] is not None:
         mask = transition_masks[t]
         if t == 1:
-            # mask: (codebook_num, codebook_num)                # NOTE: PUT IT INSIDE DOCSTRING?
-            # beam_tokens[:, :, 0] -> (bs, k)                   # NOTE: PUT IT INSIDE DOCSTRING?
+            # mask: (codebook_num, codebook_num)
+            # beam_tokens[:, :, 0] -> (bs, k)
             # logger.debug(f"t: {t}, mask shape: {mask.shape}, beam_tokens[:, :, 0] shape: {beam_tokens[:, :, 0].shape}")
             # logger.debug(f"mask[beam_tokens[:, :, 0]] shape: {mask[beam_tokens[:, :, 0]].shape}")
             return mask[beam_tokens[:, :, 0]] # (bs, k, codebook_num)
         elif t == 2:
-            # mask: (codebook_num, codebook_num, codebook_num) # NOTE: PUT IT INSIDE DOCSTRING?
-            # beam_tokens[:, :, :2] -> (bs, k, 2)              # NOTE: PUT IT INSIDE DOCSTRING?
+            # mask: (codebook_num, codebook_num, codebook_num)
+            # beam_tokens[:, :, :2] -> (bs, k, 2)
             return mask[beam_tokens[:, :, 0], beam_tokens[:, :, 1]] # (bs, k, codebook_num)
 
     elif (t == 3 and prefix_to_uidx_t3 is not None and
@@ -742,12 +743,13 @@ class T54Rec(nn.Module):
     def _create_t5_model(self) -> QT5:
         """
         Create the T5 model with the specified configuration.
-        TODO: Explain that for multi-head projection, we need to load a T5 model and then replace the projection head.
+        For multi-head projection, we need to load a T5 model and then replace the projection head.
         At inference, we simply load the QT5 model (with multi-head projection already in place).
         """
         if self.cfg.is_pretrained_model:
             # For inference or finetuning with SETRec config
             logger.info("Loading pretrained T5 model...")
+            print("Loading model from:", self.cfg.base_model)
             model = QT5.from_pretrained(
                 self.cfg.base_model,
                 local_files_only=True,
@@ -757,11 +759,15 @@ class T54Rec(nn.Module):
             )
             model = cast(QT5, model)
 
+            # try: 
+            #     logger.debug("model.t5_model.state_dict(): {}".format(model.state_dict()))
+            # except:
+            #     pass
+
         else:
             # To train from scratch
             logger.info("Initializing T5Config...")
-            config_path = os.path.join(self.cfg.cache_dir, "config.json")
-            t5_config = T5Config.from_json_file(config_path)
+            t5_config = T5Config(**self.cfg.t5_model_config.__dict__)
             model = QT5(
                 t5_config=t5_config,
                 cfg=self.cfg,

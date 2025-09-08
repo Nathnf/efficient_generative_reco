@@ -6,8 +6,8 @@ infer:
   test_batch_size: 2048
   num_beams: 20
   test_task: "seqrec"
-  results_file: "${output_dir}/results_${infer.test_task}_${infer.num_beams}.json"
-  save_file: "${output_dir}/save_${infer.test_task}_${infer.num_beams}.json"
+  results_file: "${infer.output_dir}/results_${infer.test_task}_${infer.num_beams}.json"
+  save_file: "${infer.output_dir}/save_${infer.test_task}_${infer.num_beams}.json"
   use_constraints: true
   filter_items: true
   first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"

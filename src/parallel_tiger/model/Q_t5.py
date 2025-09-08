@@ -359,7 +359,7 @@ class QT5(T5ForConditionalGeneration):
         code_num = cfg.code_num
         is_inference = cfg.is_inference
         use_multi_head = cfg.use_multi_head
-        bias_config = cfg.bias_config
+        bias_config = cfg.bias_config       
 
         self.shared = nn.Embedding(t5_config.vocab_size, t5_config.d_model)
 
@@ -415,10 +415,6 @@ class QT5(T5ForConditionalGeneration):
         # Model parallel
         self.model_parallel = False
         self.device_map = None
-
-        logger.debug("self.t5_config.tie_word_embeddings: %s", self.t5_config.tie_word_embeddings)
-        self.t5_config.tie_word_embeddings = False
-        logger.debug("self.t5_config.tie_word_embeddings (after): %s", self.t5_config.tie_word_embeddings)
 
     def _create_multi_heads(self):
         # self.lm_heads = nn.ModuleList([

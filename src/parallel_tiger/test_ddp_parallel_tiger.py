@@ -20,7 +20,8 @@ from clearml import Task
 
 from parallel_tiger.model.model_t5 import T54Rec
 from parallel_tiger.tokenizer.custom_tokenizer import CustomT5Tokenizer
-from parallel_tiger.model.config import create_config_from_hydra_cfg
+from parallel_tiger.model.config import ModelConfig
+from parallel_tiger.utils.io import ensure_dir
 from parallel_tiger.utils.misc import set_seed
 from parallel_tiger.utils.data_loading import (
     load_test_dataset,
@@ -58,6 +59,7 @@ def gather_list(target, world_size):
 def test_ddp(cfg: DictConfig):
 
     set_seed(cfg.seed)
+    ensure_dir(cfg.infer.output_dir)
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK") or 0)
     torch.cuda.set_device(local_rank)
@@ -100,18 +102,21 @@ def test_ddp(cfg: DictConfig):
     tokenizer.padding_side = "left"
     special_tokenizer_tokens_num = len(tokenizer.special_tokens_map)
 
-    model_config = create_config_from_hydra_cfg(
-        cfg,
-        is_inference=True,
-        is_pretrained_model=True,
-        device_map=device_map,
-        tokenizer_special_tokens_num=special_tokenizer_tokens_num,
-    )
+    # model_config = create_config_from_hydra_cfg(
+    #     cfg,
+    #     is_inference=True,
+    #     is_pretrained_model=True,
+    #     device_map=device_map,
+    #     tokenizer_special_tokens_num=special_tokenizer_tokens_num,
+    # )
+    model_config = ModelConfig.load(cfg.output_dir)
+    model_config.update_config_to_inference_mode(cfg.infer, device_map)
+    logger.info(f"Model config: {model_config}")
     model_config.mask_token_id = tokenizer.mask_token_id
     model = T54Rec(model_config)
 
-    if local_rank == 0:
-        log_embedding_tables(cfg, model)
+    # if local_rank == 0:
+    #     log_embedding_tables(cfg, model)
 
     if cfg.infer.debug:
         cfg.infer.test_batch_size = 3
@@ -274,9 +279,6 @@ def test_ddp(cfg: DictConfig):
                         logger.info("Metrics results: {}".format(temp))
 
                 dist.barrier()
-
-                if step > 5:
-                    break
 
             if local_rank == 0 and not cfg.infer.debug:
                 for m in metrics_results:

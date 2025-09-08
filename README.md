@@ -323,7 +323,7 @@ PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
 PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
     src/parallel_tiger/finetune_parallel_tiger.py \
     exp_name="codebook_decoder_self_attention_bias_lr5e_3" \
-    has_relative_decoder_codebook_bias_sa=True \
+    model.has_relative_decoder_codebook_bias_sa=True \
     train.learning_rate=5e-3
 ```
 
@@ -331,11 +331,11 @@ PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
 
 ### 6. Inference with Parallel TIGER
 
-Run inference with the same experiment setup:
+Run inference with the same experiment name:
 
 ```bash
 PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
-    src/parallel_tiger/test_ddp_parallel_tiger.py exp_name="EXP_NAME" +args
+    src/parallel_tiger/test_ddp_parallel_tiger.py exp_name="EXP_NAME" +inference_args
 ```
 
 **Example:**
@@ -344,6 +344,4 @@ PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
 PYTHONPATH=src torchrun --nproc_per_node=2 --master_port=2309 \
     src/parallel_tiger/test_ddp_parallel_tiger.py \
     exp_name="codebook_decoder_self_attention_bias_lr5e_3" \
-    has_relative_decoder_codebook_bias_sa=True \
-    train.learning_rate=5e-3
 ```

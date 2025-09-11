@@ -619,7 +619,6 @@ class QT5(T5ForConditionalGeneration):
 
         loss = None
         if labels is not None:
-            logger.debug("SHOULDN'T BE HERE - computing QT5 loss...")
             loss_fct = CrossEntropyLoss(ignore_index=-100)
             # move labels to correct device to enable PP
             labels = labels.to(lm_logits.device)

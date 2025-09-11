@@ -10,7 +10,6 @@ class Collator(object):
 
     def __init__(self, cfg, tokenizer):
         self.cfg = cfg
-        self.only_train_response = cfg.dataset.only_train_response
         self.tokenizer = tokenizer
         self.masked_training = cfg.train.training_mode==TrainingMode.MASKED.value
         if self.tokenizer.pad_token_id is None:

@@ -1,0 +1,101 @@
+train: 
+  experiment_name: "${exp_name}_train"
+  batch_size: 1024
+  # micro_batch_size: 512
+  learning_rate: 1e-2
+  weight_decay: 0.01
+  lr_scheduler: "cosine"
+  warmup_steps: 1000
+  early_stopping_patience: 10
+  max_epochs: 100
+  gradient_accumulation_steps: 2
+  fp16: false
+  bf16: false
+  check_val_every_n_epoch: 1
+  save_and_eval_steps: 200
+  logging_step: 50
+  limit_val_batches: 1.0 # full validation 
+  enable_clearml: true
+  tasks: "seqrec" # Downstream tasks, separate by comma
+  valid_task: "seqrec"
+  training_mode: "standard"
+
+
+
+  # # optim: "adamw_torch"
+  # model_max_length: 2048
+  # resume_from_checkpoint: null  # either training checkpoint or final adapter
+  # warmup_ratio: 0.0 #0.01
+  # save_and_eval_strategy: "epoch"
+  # gradient_checkpointing: false
+  # deepspeed: "./config/ds_z3_bf16.json"
+  # # patient: 10
+  
+  # # REMOVE THEM FOR NOW
+  # normalization_method: "per_sample" # normalization method for the masked training ["per_sample", "per_batch", "unnormalized"]
+
+  # num_epochs: 200
+  # cutoff_len: 4096
+
+model:
+  # Similar values to TIGER model
+  dim: 128
+  max_spatial_seq_len: ${dataset.max_his_len}
+  spatial_layers: 4
+  depth_layers: 4
+  dim_head: 64
+  heads: 6
+  attn_dropout: 0.1
+  ff_mult: 4
+  ff_dropout: 0.1
+  attention_type: "full"
+
+dataloader:
+  num_workers: 8
+
+
+  
+
+
+
+  # d_model: 512
+  # d_kv: 64
+  # d_ff: 2048
+  # num_layers: 6
+  # num_heads: 8
+  # relative_attention_num_buckets: 32
+  # relative_attention_max_distance: 128
+  # dropout_rate: 0.1
+  # layer_norm_epsilon: 1e-6
+
+  # tie_word_embeddings: false # argument to tie input (`shared`) and output (`lm_head`) projection layers, in the single head case
+  # has_relative_encoder_item_bias: true
+  # has_relative_encoder_codebook_bias: true
+  # has_relative_decoder_item_bias_sa: true
+  # has_relative_decoder_codebook_bias_sa: true
+  # has_relative_decoder_item_bias_ca: false
+  # has_relative_decoder_codebook_bias_ca: false
+  # encoder_aggregation: "sum" # "flatten" (encoder sees every item token), "sum", "mean", or "concat"
+  # use_multi_head: false # false for single head, true for multiple projection heads (one per token/query)
+
+
+hydra:
+  run:
+    dir: ./outputs/${dataset.name}/${quantizer_type}/parallel_TIGER/${exp_name}/train/${now:%Y-%m-%d_%H-%M-%S}
+  
+  job_logging:
+    version: 1
+    root:
+      handlers: [console, file]
+      level: DEBUG
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.run.dir}/train_job.log
+    formatters:
+      simple:
+        format: "[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s"

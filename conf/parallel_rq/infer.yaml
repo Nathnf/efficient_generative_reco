@@ -1,0 +1,50 @@
+# infer: 
+#   experiment_name: "${exp_name}_inference"
+#   generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search'
+#   ckpt_dir: "${output_dir}"
+#   output_dir: "${output_dir}/inference/${infer.generation_mode}" # NOT USED CURRENTLY?
+#   test_batch_size: 2048
+#   num_beams: 20
+#   test_task: "seqrec"
+#   results_file: "${infer.output_dir}/results_${infer.test_task}_${infer.num_beams}.json"
+#   save_file: "${infer.output_dir}/save_${infer.test_task}_${infer.num_beams}.json"
+#   use_constraints: true
+#   filter_items: true
+#   first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"
+#   transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}.pt"
+#   transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
+#   prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
+#   uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
+
+#   sample_num: -1  # test sample number, -1 represents using all test data
+#   gpu_id: 0
+#   test_prompt_ids: "0"  # test prompt ids, separate by comma. 'all' represents using all
+#   metrics: "hit@1,hit@5,hit@10,ndcg@5,ndcg@10"  # test metrics, separate by comma
+#   debug: false
+
+#   enable_clearml: true
+  
+
+# hydra:
+#   run:
+#     dir: ./outputs/${dataset.name}/${quantizer_type}/parallel_TIGER/${exp_name}/infer/${infer.generation_mode}/${now:%Y-%m-%d_%H-%M-%S}
+
+#   job_logging:
+#     version: 1
+#     root:
+#       handlers: [console, file]
+#       level: DEBUG
+#     handlers:
+#       console:
+#         class: logging.StreamHandler
+#         formatter: simple
+#       file:
+#         class: logging.FileHandler
+#         formatter: simple
+#         filename: ${hydra.run.dir}/inference_job.log
+#     formatters:
+#       simple:
+#         format: "[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s"
+
+
+

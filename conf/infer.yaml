@@ -1,6 +1,6 @@
 infer: 
   experiment_name: "${exp_name}_inference"
-  generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search'
+  generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search' (autoregressive not supported yet)
   ckpt_dir: "${output_dir}"
   output_dir: "${output_dir}/inference/${infer.generation_mode}" # NOT USED CURRENTLY?
   test_batch_size: 2048
@@ -23,7 +23,9 @@ infer:
   debug: false
 
   enable_clearml: true
-  
+
+  stochastic_decoding: false
+  temperatures: [1.0, 1.0, 1.0, 1.0]
 
 hydra:
   run:

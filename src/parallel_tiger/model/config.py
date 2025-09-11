@@ -147,6 +147,8 @@ class ModelConfig:
     encoder_aggregation: str = EncoderAggregation.SUM.value
     is_aggregate_tokens: bool = field(init=False)
     t5_model_config: Optional[T5ModelConfig] = None
+    stochastic_decoding: bool = False
+    temperatures: Optional[List[float]] = None
 
     def __post_init__(self):
         if self.is_inference:
@@ -178,6 +180,8 @@ class ModelConfig:
             "encoder_aggregation": self.encoder_aggregation,
             "is_aggregate_tokens": self.is_aggregate_tokens,
             "t5_model_config": self.t5_model_config,
+            "stochastic_decoding": self.stochastic_decoding,
+            "temperatures": self.temperatures,
         }
 
     def update_config_to_inference_mode(self, cfg_infer, device_map):
@@ -187,6 +191,8 @@ class ModelConfig:
         self.base_model = cfg_infer.ckpt_dir
         self.generation_mode = cfg_infer.generation_mode
         self.device_map = device_map
+        self.stochastic_decoding = cfg_infer.stochastic_decoding
+        self.temperatures = cfg_infer.temperatures
 
     def save(self, folder_path: str):
         path = os.path.join(folder_path, "model_config.pkl")

@@ -8,7 +8,7 @@ from einops import reduce
 
 from parallel_tiger.model.config import EncoderAggregation, TrainingMode, TrainingConfig, ModelConfig # type: ignore[reportMissingImports]
 from parallel_tiger.model.Q_t5 import QT5                                                             # type: ignore[reportMissingImports]
-from parallel_tiger.generation.beam_search_decoding import ParallelBeamSearchGenerator
+from parallel_tiger.generation.beam_search_decoding import ParallelBeamSearchGenerator                # type: ignore[reportMissingImports]
 from parallel_tiger.generation.trie import Trie                                                       # type: ignore[reportMissingImports]
 
 import time as time

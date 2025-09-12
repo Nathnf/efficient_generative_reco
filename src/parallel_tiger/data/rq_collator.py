@@ -217,7 +217,6 @@ class TestCollator(object):
     def __init__(self, cfg, tokenizer):
         self.cfg = cfg
         self.tokenizer = tokenizer
-        self.prefix_token = getattr(cfg, "prefix_token", "")
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = 0
 
@@ -226,8 +225,7 @@ class TestCollator(object):
             self.tokenizer.padding_side = "left"
 
     def __call__(self, batch):
-
-        input_texts = [d["input_ids"] + self.prefix_token for d in batch]
+        input_texts = [d["input_ids"] for d in batch]
         targets = [d["labels"] for d in batch]
         users = [d["label"] for d in batch]
 

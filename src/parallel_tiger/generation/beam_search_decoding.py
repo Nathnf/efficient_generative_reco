@@ -4,7 +4,6 @@ from parallel_tiger.generation.trie import Trie                                 
 
 import time as time
 from typing import List, Dict, Tuple, Optional
-from parallel_tiger.model.model_t5 import T54Rec
 
 import logging
 
@@ -160,12 +159,12 @@ def _update_beams_stochastic(
 class CustomGeneration:
     def __init__(
         self, 
-        model: 'T54Rec', 
+        model: 'T54Rec', # type: ignore[reportMissingTypeStubs]
         use_multi_head: bool, 
         mask_token_id: int, 
         stochastic: bool,
         temperatures: Optional[List[float]] = None,
-    ):
+    ) -> None:
         self.model = model
         self.use_multi_head = use_multi_head
         self.mask_token_id = mask_token_id
@@ -250,7 +249,14 @@ class CustomGeneration:
     
 
 class ParallelBeamSearchGenerator(CustomGeneration):
-    def __init__(self, model: 'T54Rec', use_multi_head: bool=False, mask_token_id: int=3, stochastic: bool=False, temperatures: Optional[List[float]]=None):
+    def __init__(
+        self, 
+        model: 'T54Rec', # type: ignore[reportMissingTypeStubs]
+        use_multi_head: bool=False, 
+        mask_token_id: int=3, 
+        stochastic: bool=False, 
+        temperatures: Optional[List[float]]=None
+    ) -> None:
         super().__init__(model, use_multi_head, mask_token_id, stochastic, temperatures)
         self._update_beams_fn = _update_beams_stochastic if stochastic else _update_beams_greedy
 

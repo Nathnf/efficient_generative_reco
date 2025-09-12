@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch import nn, einsum
 
 from einops import rearrange, reduce, repeat
+from parallel_tiger.generation.beam_search_decoding_rq import ParallelBeamSearchGenerator
 
 # helpers
 
@@ -273,7 +274,8 @@ class RQTransformer(nn.Module):
 
 
 
-
+import logging
+logger = logging.getLogger(__name__)
 
 class BaseSelfAttention(nn.Module):
     def __init__(self, dim, dim_head=64, heads=8, dropout=0.):
@@ -415,7 +417,32 @@ class RQQTransformer(nn.Module):
             nn.Linear(dim, num_tokens, bias=False) for _ in range(depth_seq_len)
         ) # NOTE: THIS DOES A SEPARATE PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
         self.pad_id = pad_id
+        self._setup_generation_components()
         self._check_insert_start_token()
+
+    def set_first_token_constraint_mask(self, first_token_constraint_mask):
+        self.first_token_constraint_mask = first_token_constraint_mask.to(dtype=torch.bool)
+
+    def set_transition_constraint_masks(self, transition_mask_t1, transition_mask_t2):
+        self.transition_constraint_masks = {
+            1: transition_mask_t1.to(dtype=torch.bool),
+            2: transition_mask_t2.to(dtype=torch.bool),
+        }
+
+    def set_transition_constraints_fast_t3(self, prefix_to_uidx_t3, uidx_to_next_tokens_t3):
+        self.prefix_to_uidx_t3 = prefix_to_uidx_t3.to(dtype=torch.long)
+        self.uidx_to_next_tokens_t3 = uidx_to_next_tokens_t3.to(dtype=torch.bool)
+
+    def set_candidate_trie(self, candidate_trie):
+        self.candidate_trie = candidate_trie
+
+    def _setup_generation_components(self):
+        self.generator = ParallelBeamSearchGenerator(
+            model=self,
+            use_multi_head=True,
+            stochastic=False,   # LATER: NOT HARDCODE IT
+            temperatures=None,  # IDEM
+        )
 
     def _insert_start_token(self, spatial_tokens, attention_mask, start_token):
         # spatial_tokens: (b, s, f)
@@ -509,6 +536,7 @@ class RQQTransformer(nn.Module):
 
         tokens_with_depth_pos = tokens + depth_pos
         # # print(f"_spatial_forward: tokens_with_depth_pos: \n{tokens_with_depth_pos}\n")
+        #### logger.info(f"_spatial_forward: passed tokens + depth_pos")
 
         # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
         spatial_tokens = reduce(tokens_with_depth_pos, 'b s d f -> b s f', 'sum') + spatial_pos 
@@ -528,10 +556,12 @@ class RQQTransformer(nn.Module):
         spatial_tokens, spatial_attention_mask = self._insert_start_token(spatial_tokens, spatial_attention_mask, self.spatial_start_token) # (b, s+1, f), (b, s+1)
         # # print(f"_spatial_forward: spatial_tokens after inserting start token: \n{spatial_tokens}\n")
         # # print(f"_spatial_forward: spatial_attention_mask after inserting start token: \n{spatial_attention_mask}\n")
+        #### logger.info(f"_spatial_forward: passed _insert_start_token")
 
         spatial_tokens = self.spatial_transformer(spatial_tokens, spatial_attention_mask) # (b, s+1, f)
         # # print(f"_spatial_forward: spatial_tokens shape after transformer: {spatial_tokens.shape}")
         # # print(f"_spatial_forward: spatial_tokens after transformer: \n{spatial_tokens}\n")
+        #### logger.info(f"_spatial_forward: passed spatial_transformer")
 
         return spatial_tokens, b, spatial_seq_len
 
@@ -598,30 +628,36 @@ class RQQTransformer(nn.Module):
 
     def _get_logits_from_last_spatial_token(self, ids, attention_mask):
         spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s+1, f)
+        #### logger.info("_get_logits_from_last_spatial_token: passed _spatial_forward")
 
         last_spatial_token = spatial_tokens[:, -1, :] # (b, f) # only keep the last spatial token
         # # print(f"_get_logits_from_last_spatial_token: last_spatial_token shape: {last_spatial_token.shape}")
         # # print(f"_get_logits_from_last_spatial_token: last_spatial_token: \n{last_spatial_token}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed spatial_tokens[:, -1, :]")
 
         last_spatial_token = last_spatial_token[:, None, None, :]
         depth_queries = repeat(self.depth_queries, 'd f -> b 1 d f', b = b)
         depth_tokens = torch.cat((last_spatial_token, depth_queries), dim=2) # (b, 1, 1+d, f)
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens shape before squeezing: {depth_tokens.shape}")
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens before squeezing: \n{depth_tokens}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed depth_tokens cat")
 
         depth_tokens = depth_tokens.squeeze(1) # (b, 1+d, f)
 
         depth_tokens = self.depth_transformer(depth_tokens) # (b, d, f)
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens shape after depth transformer: {depth_tokens.shape}")
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens after depth transformer: \n{depth_tokens}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed depth_transformer")
 
         queries_out = depth_tokens[:, 1:, :] # (b, d, f)
         # # print(f"_get_logits_from_last_spatial_token: queries_out shape after removing spatial token: {queries_out.shape}")
         # # print(f"_get_logits_from_last_spatial_token: queries_out after removing spatial token: \n{queries_out}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed removing spatial token")
 
         logits = torch.stack([layer(queries_out[:,i,:]) for i, layer in enumerate(self.to_logits)], dim=1) # (b, d, num_tokens)
         # # print(f"_get_logits_from_last_spatial_token: logits shape before returning: {logits.shape}")
         # # print(f"_get_logits_from_last_spatial_token: logits before returning: \n{logits}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed logits computation")
 
         return logits, b
     
@@ -650,10 +686,9 @@ class RQQTransformer(nn.Module):
         loss = F.cross_entropy(preds, labels, ignore_index = -100) # NB: there shouldn't be any padding in validation
         return loss
 
-    def generate(self, ids, attention_mask):
+    def generate(self, ids, attention_mask, topK=20, use_constraints=True):
         logits = self.forward_inference(ids, attention_mask)
-        # TODO: Add same generation function as in T54Rec (cf. my custom implementation)
-        pass
+        return self.generator.generate(logits, topK, use_constraints)
 
 
 
@@ -661,7 +696,17 @@ import pytorch_lightning as pl
 import transformers
 
 class LitRQQTransformer(pl.LightningModule):
-    def __init__(self, model, lr=1e-3, weight_decay=1e-2, lr_scheduler_type='linear', warmup_steps=100, distributed=True):
+    def __init__(
+        self, 
+        model, 
+        lr=1e-3, 
+        weight_decay=1e-2, 
+        lr_scheduler_type='linear', 
+        warmup_steps=100, 
+        distributed=True,
+        topK=20,
+        use_constraints=True
+    ):
         super().__init__()
         self.model = model
         self.lr = lr
@@ -669,10 +714,9 @@ class LitRQQTransformer(pl.LightningModule):
         self.lr_scheduler_type = lr_scheduler_type
         self.warmup_steps = warmup_steps
         self.distributed = distributed
-
-    # def forward(self, ids, attention_mask):
-    #     # forward for inference
-    #     return self.model.forward_inference(ids, attention_mask)
+        self.topK = topK
+        self.use_constraints = use_constraints
+        # self.save_hyperparameters()
 
     def training_step(self, batch, batch_idx):
         ids, attention_mask = batch["input_ids"], batch["attention_mask"]
@@ -697,4 +741,25 @@ class LitRQQTransformer(pl.LightningModule):
             num_training_steps=int(self.trainer.estimated_stepping_batches)
         )
         return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+
+    def predict_step(self, batch, batch_idx):
+        inputs, targets, users = batch
+        ids, attention_mask = inputs["input_ids"], inputs["attention_mask"]
+
+        #### logger.info(f"predict_step: ids device: {ids.device}")
+
+        output = self.model.generate(
+            ids,
+            attention_mask,
+            self.topK,
+            self.use_constraints
+        ) # {"sequences": ..., "sequences_scores": ...}
+
+        # Attach metadata for evaluation
+        return {
+            "preds": output["sequences"],
+            "scores": output["sequences_scores"],
+            "targets": targets,
+            "users": users
+        }
 

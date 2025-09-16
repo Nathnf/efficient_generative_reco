@@ -1,38 +1,14 @@
 import torch
 import torch.nn.functional as F
 from torch import nn, einsum
+from typing import Optional
 
 from einops import rearrange, reduce, repeat
 from parallel_tiger.generation.beam_search_decoding_rq import ParallelBeamSearchGenerator
+from parallel_tiger.generation.trie import Trie   
 
-# helpers
-
-def exists(val):
-    return val is not None
-
-def default(val, d):
-    return val if exists(val) else d
-
-def remainder_to_mult(num, mult):
-    return (mult - num % mult) % mult
-
-def log(t, eps = 1e-20):
-    return torch.log(t.clamp(min = eps))
-
-def gumbel_noise(t):
-    noise = torch.zeros_like(t).uniform_(0, 1)
-    return -log(-log(noise))
-
-def gumbel_sample(t, temperature = 1., dim = -1):
-    return ((t / temperature) + gumbel_noise(t)).argmax(dim = dim)
-
-def top_k(logits, thres = 0.5):
-    num_logits = logits.shape[-1]
-    k = max(int((1 - thres) * num_logits), 1)
-    val, ind = torch.topk(logits, k)
-    probs = torch.full_like(logits, float('-inf'))
-    probs.scatter_(1, ind, val)
-    return probs
+import logging
+logger = logging.getLogger(__name__)
 
 # helper classes
 
@@ -44,238 +20,6 @@ def FeedForward(*, dim, mult = 4, dropout = 0.):
         nn.Dropout(dropout),
         nn.Linear(dim * mult, dim)
     )
-
-class Attention(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        dim_head = 64,
-        heads = 8,
-        dropout = 0.
-    ):
-        super().__init__()
-        self.scale = dim_head ** -0.5
-        self.heads = heads
-        inner_dim = dim_head * heads
-
-        self.dropout = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(dim)
-        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_out = nn.Linear(inner_dim, dim, bias = False)
-
-    def forward(self, x):
-        h, device = self.heads, x.device
-
-        x = self.norm(x) # (b, n, inner_dim)
-        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
-
-        q = q * self.scale
-        sim = einsum('b h i d, b h j d -> b h i j', q, k)
-
-        i, j = sim.shape[-2:]
-        mask_value = -torch.finfo(sim.dtype).max
-        mask = torch.ones((i, j), dtype = torch.bool, device = device).triu(j - i + 1)
-        sim = sim.masked_fill(mask, mask_value)
-
-        sim = sim - sim.amax(dim = -1, keepdim = True).detach()
-        attn = sim.softmax(dim = -1)
-        attn = self.dropout(attn)
-
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
-
-class Transformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        layers,
-        dim_head = 64,
-        heads = 8,
-        attn_dropout = 0.,
-        ff_dropout = 0.,
-        ff_mult = 4
-    ):
-        super().__init__()
-        self.layers = nn.ModuleList([])
-        for _ in range(layers):
-            self.layers.append(nn.ModuleList([
-                Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = attn_dropout),
-                FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout)
-            ]))
-
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x):
-        for attn, ff in self.layers:
-            x = attn(x) + x
-            x = ff(x) + x
-
-        return self.norm(x)
-
-# main class
-
-class RQTransformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        num_tokens,
-        dim,
-        max_spatial_seq_len,
-        depth_seq_len,
-        spatial_layers,
-        depth_layers,
-        dim_head = 64,
-        heads = 8,
-        attn_dropout = 0.,
-        ff_mult = 4,
-        ff_dropout = 0.,
-        pad_id = 0
-    ):
-        super().__init__()
-        self.dim = dim
-        self.max_spatial_seq_len = max_spatial_seq_len
-        self.depth_seq_len = depth_seq_len
-
-        self.token_emb = nn.Embedding(num_tokens, dim)
-        self.spatial_start_token = nn.Parameter(torch.randn(dim))
-
-        self.spatial_pos_emb = nn.Embedding(max_spatial_seq_len + 1, dim) # account for a boundary case
-        self.depth_pos_emb = nn.Embedding(depth_seq_len, dim)
-
-        self.spatial_transformer = Transformer(
-            dim = dim,
-            layers = spatial_layers,
-            dim_head = dim_head,
-            heads = heads,
-            attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout,
-            ff_mult = ff_mult
-        )
-
-        self.depth_transformer = Transformer(
-            dim = dim,
-            layers = depth_layers,
-            dim_head = dim_head,
-            heads = heads,
-            attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout,
-            ff_mult = ff_mult
-        )
-
-        self.to_logits = nn.Linear(dim, num_tokens)
-        self.pad_id = pad_id
-
-    def generate(self, prime = None, filter_thres = 0.9, temperature = 1., default_batch_size = 1):
-        total_seq_len = self.depth_seq_len * self.max_spatial_seq_len
-        device = next(self.parameters()).device
-
-        if not exists(prime):
-            prime = torch.empty((default_batch_size, 0), dtype = torch.long, device = device)
-
-        seq = prime
-
-        for _ in range(total_seq_len - seq.shape[-1]):
-            logits = self.forward(seq)[:, -1]
-            logits = top_k(logits, thres = filter_thres)
-            sampled = gumbel_sample(logits, dim = -1, temperature = temperature)
-            seq = torch.cat((seq, rearrange(sampled, 'b -> b 1')), dim = -1)
-
-        return rearrange(seq, 'b (s d) -> b s d', d = self.depth_seq_len)
-
-    def forward_empty(self, batch_size):
-        # take care of special case
-        # where you sample from input of 0 (start token only)
-
-        spatial_tokens = repeat(self.spatial_start_token, 'd -> b 1 d', b = batch_size)
-        depth_tokens = self.spatial_transformer(spatial_tokens)
-        depth_tokens = self.depth_transformer(depth_tokens)
-        return self.to_logits(depth_tokens)
-
-    def forward(self, ids, return_loss = False):
-        assert ids.ndim in {2, 3}
-        flattened_dim = ids.ndim == 2
-        ids_orig_ndim = ids.ndim
-
-        if ids.numel() == 0:
-            return self.forward_empty(ids.shape[0])
-
-        if flattened_dim:
-            # allow for ids to be given in the shape of (batch, seq)
-            # in which case it will be auto-padded to the next nearest multiple of depth seq len
-            seq_len = ids.shape[-1]
-            padding = remainder_to_mult(seq_len, self.depth_seq_len)
-            ids = F.pad(ids, (0, padding), value = self.pad_id)
-            ids = rearrange(ids, 'b (s d) -> b s d', d = self.depth_seq_len)
-        else:
-            seq_len = ids.shape[1] * ids.shape[2]
-
-        b, space, depth, device = *ids.shape, ids.device
-        assert space <= (self.max_spatial_seq_len + 1), 'spatial dimension is greater than the max_spatial_seq_len set'
-        assert depth == self.depth_seq_len, 'depth dimension must be equal to depth_seq_len'
-
-        # get token embeddings
-
-        tokens = self.token_emb(ids)
-
-        spatial_pos = self.spatial_pos_emb(torch.arange(space, device = device))
-        depth_pos = self.depth_pos_emb(torch.arange(depth, device = device))
-
-        tokens_with_depth_pos = tokens + depth_pos
-
-        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
-
-        spatial_tokens = reduce(tokens_with_depth_pos, 'b s d f -> b s f', 'sum') + spatial_pos
-
-        spatial_tokens = torch.cat((
-            repeat(self.spatial_start_token, 'f -> b 1 f', b = b),
-            spatial_tokens
-        ), dim = -2)        
-
-        spatial_tokens = self.spatial_transformer(spatial_tokens)
-
-        spatial_tokens = rearrange(spatial_tokens, 'b s f -> b s 1 f')
-
-        # spatial tokens become the start tokens of the depth dimension
-
-        tokens_with_depth_pos = F.pad(tokens_with_depth_pos, (0, 0, 0, 0, 0, 1), value = 0.)
-
-        depth_tokens = torch.cat((spatial_tokens, tokens_with_depth_pos), dim = -2)
-
-        depth_tokens = rearrange(depth_tokens, '... n d -> (...) n d')
-
-        depth_tokens = self.depth_transformer(depth_tokens)
-
-        depth_tokens = rearrange(depth_tokens, '(b s) d f -> b s d f', b = b)
-
-        logits = self.to_logits(depth_tokens)
-        logits = rearrange(logits, 'b ... f -> b (...) f')
-        logits = logits[:, :(seq_len + 1)]
-
-        if not return_loss:
-            logits = logits[:, 1:]
-
-            if flattened_dim:
-                return rearrange(logits, 'b ... n -> b (...) n')
-
-            return logits
-
-        logits = logits[:, :-1]
-        
-        preds = rearrange(logits, 'b ... c -> b c (...)')
-        labels = rearrange(ids, 'b s d -> b (s d)')
-
-        loss = F.cross_entropy(preds, labels, ignore_index = self.pad_id)
-        return loss
-    
-
-
-
-import logging
-logger = logging.getLogger(__name__)
 
 class BaseSelfAttention(nn.Module):
     def __init__(self, dim, dim_head=64, heads=8, dropout=0.):
@@ -350,6 +94,380 @@ class DecoderOnlyTransformer(nn.Module):
         for layer in self.layers:
             x = layer(x, mask=mask)
         return self.norm(x)
+
+# main class
+
+class RQTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_tokens,
+        dim,
+        max_spatial_seq_len,
+        depth_seq_len,
+        spatial_layers,
+        depth_layers,
+        dim_head = 64,
+        heads = 8,
+        attn_dropout = 0.,
+        ff_mult = 4,
+        ff_dropout = 0.,
+        pad_id = 0,
+        num_special_tokens = 4
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_spatial_seq_len = max_spatial_seq_len
+        self.depth_seq_len = depth_seq_len
+        self.num_tokens = num_tokens
+        self.num_special_tokens = num_special_tokens
+
+        # self.token_emb = nn.Embedding(num_tokens, dim)
+        self.token_emb = nn.Embedding(num_tokens * depth_seq_len + num_special_tokens, dim)
+        self.spatial_start_token = nn.Parameter(torch.randn(dim))
+
+        self.spatial_pos_emb = nn.Embedding(max_spatial_seq_len + 1, dim) # account for a boundary case
+        self.depth_pos_emb = nn.Embedding(depth_seq_len, dim)
+
+        self.spatial_transformer = DecoderOnlyTransformer(
+            dim = dim,
+            layers = spatial_layers,
+            attn_cls=CausalSelfAttention,
+            ff_cls=FeedForward,
+            dim_head = dim_head,
+            heads = heads,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout,
+            ff_mult = ff_mult
+        )
+
+        self.depth_transformer = DecoderOnlyTransformer(
+            dim = dim,
+            layers = depth_layers,
+            attn_cls=CausalSelfAttention,
+            ff_cls=FeedForward,
+            dim_head = dim_head,
+            heads = heads,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout,
+            ff_mult = ff_mult
+        )
+
+        # self.to_logits = nn.Linear(dim, num_tokens)
+        self.to_logits = nn.ModuleList(
+            nn.Linear(dim, num_tokens, bias=False) for _ in range(depth_seq_len)
+        ) # NOTE: THIS DOES A SEPARATE PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
+        self.pad_id = pad_id
+        self.candidate_trie: Optional[Trie] = None
+
+    def set_candidate_trie(self, candidate_trie: Trie):
+        self.candidate_trie = candidate_trie
+
+    def set_first_token_constraint_mask(self, first_token_constraint_mask):
+        # placeholder
+        pass
+
+    def set_transition_constraint_masks(self, transition_mask_t1, transition_mask_t2):
+        # placeholder
+        pass
+
+    def set_transition_constraints_fast_t3(self, prefix_to_uidx_t3, uidx_to_next_tokens_t3):
+        # placeholder
+        pass
+
+    def _insert_start_token(self, spatial_tokens, attention_mask, start_token):
+        # spatial_tokens: (b, s, f)
+        # attention_mask: (b, s) - True for non-padding tokens
+        # start_token: (f,)
+        b, s, f = spatial_tokens.shape
+        device = spatial_tokens.device
+        is_padding = ~attention_mask
+        last_padding_index = is_padding.sum(dim=-1)
+        spatial_tokens_extended = torch.zeros((b, s+1, f), dtype=spatial_tokens.dtype, device=device)
+        batch_dim = torch.arange(b, dtype=torch.long, device=device)
+        spatial_tokens_extended[batch_dim, last_padding_index] = start_token.expand(b, f)
+        is_padding_extended = torch.cat([is_padding, torch.zeros((b,1), dtype=torch.bool, device=device)], dim=1)
+        spatial_tokens_r_extended = torch.cat([spatial_tokens, torch.zeros((b,1,f), device=device)], dim=1)
+        spatial_tokens_extended = torch.where(
+            is_padding_extended.unsqueeze(-1),
+            spatial_tokens_r_extended,
+            spatial_tokens_extended
+        )
+        is_not_padding_extended = torch.cat([torch.zeros((b,1), dtype=torch.bool, device=device), attention_mask], dim=1)
+        spatial_tokens_l_extended = torch.cat([torch.zeros((b,1,f), device=device), spatial_tokens], dim=1)
+        spatial_tokens_extended = torch.where(
+            is_not_padding_extended.unsqueeze(-1),
+            spatial_tokens_l_extended,
+            spatial_tokens_extended
+        )
+        attention_mask_extended = torch.cat([attention_mask, torch.ones((b,1), dtype=torch.bool, device=device)], dim=1)
+        return spatial_tokens_extended, attention_mask_extended
+
+    def _spatial_forward(self, ids, attention_mask):
+        # require flattened input for compability with MQL4GRec data collator
+        assert ids.ndim == 2 # ids: (b, spatial_seq_len * d)
+        assert attention_mask.ndim == 2 # attention_mask: (b, spatial_seq_len * d)
+
+        ids = rearrange(ids, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
+        attention_mask = rearrange(attention_mask, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
+
+        b, spatial_seq_len, depth, device = *ids.shape, ids.device
+        assert spatial_seq_len <= (self.max_spatial_seq_len + 1), f'spatial dimension ({spatial_seq_len}) is greater than the max_spatial_seq_len set ({self.max_spatial_seq_len + 1})'
+        assert depth == self.depth_seq_len, 'depth dimension must be equal to depth_seq_len'
+        # # print(f"_spatial_forward: ids shape: {ids.shape}")
+        # # print(f"_spatial_forward: ids: \n{ids}\n")
+
+        # get token embeddings
+        tokens = self.token_emb(ids) # (b, spatial_seq_len, d, f)
+        # # print(f"_spatial_forward: tokens shape: {tokens.shape}")
+        # # print(f"_spatial_forward: tokens: \n{tokens}\n")
+
+        spatial_pos = self.spatial_pos_emb(torch.arange(spatial_seq_len, device = device))
+        depth_pos = self.depth_pos_emb(torch.arange(depth, device = device))
+        # # print(f"_spatial_forward: spatial_pos shape: {spatial_pos.shape}")
+        # # print(f"_spatial_forward: spatial_pos: \n{spatial_pos}\n")
+        # # print(f"_spatial_forward: depth_pos shape: {depth_pos.shape}")
+        # # print(f"_spatial_forward: depth_pos: \n{depth_pos}\n")
+
+        tokens_with_depth_pos = tokens + depth_pos
+        # # print(f"_spatial_forward: tokens_with_depth_pos: \n{tokens_with_depth_pos}\n")
+        #### logger.info(f"_spatial_forward: passed tokens + depth_pos")
+
+        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
+        spatial_tokens = reduce(tokens_with_depth_pos, 'b s d f -> b s f', 'sum') + spatial_pos 
+        # s: spatial dim (seq len)
+        # d: depth dim (depth_seq_len)
+        # f: feature dim (embedding size)
+        # # print(f"_spatial_forward: spatial_tokens shape before adding start token: {spatial_tokens.shape}")
+        # # print(f"_spatial_forward: spatial_tokens before adding start token: \n{spatial_tokens}\n")
+
+        spatial_attention_mask = attention_mask.any(dim = -1)
+        # # print(f"_spatial_forward: spatial_attention_mask shape: {spatial_attention_mask.shape}")
+        # # print(f"_spatial_forward: spatial_attention_mask: \n{spatial_attention_mask}\n")
+
+        # replace every spatial pad token by the start token
+        # spatial_tokens[~spatial_attention_mask] = self.spatial_start_token # NB: can't simply do that because we remove the shifting --> model not autoregressive anymore
+        # Insert start token at the position of the last padding token for each batch element - also adapt attention mask
+        spatial_tokens, spatial_attention_mask = self._insert_start_token(spatial_tokens, spatial_attention_mask, self.spatial_start_token) # (b, s+1, f), (b, s+1)
+        # # print(f"_spatial_forward: spatial_tokens after inserting start token: \n{spatial_tokens}\n")
+        # # print(f"_spatial_forward: spatial_attention_mask after inserting start token [:10]: \n{spatial_attention_mask[:10]}\n")
+        # # print(f"_spatial_forward: ids[:10]: \n{ids[:10]}\n")
+        #### logger.info(f"_spatial_forward: passed _insert_start_token")
+
+        spatial_tokens = self.spatial_transformer(spatial_tokens, spatial_attention_mask) # (b, s+1, f)
+        # # print(f"_spatial_forward: spatial_tokens shape after transformer: {spatial_tokens.shape}")
+        # # print(f"_spatial_forward: spatial_tokens after transformer: \n{spatial_tokens}\n")
+        #### logger.info(f"_spatial_forward: passed spatial_transformer")
+
+        return tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len
+
+    def forward(self, ids, attention_mask):
+        tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
+
+        spatial_tokens = rearrange(spatial_tokens, 'b s f -> b s 1 f')
+
+        # spatial tokens become the start tokens of the depth dimension
+        tokens_with_depth_pos = F.pad(tokens_with_depth_pos, (0, 0, 0, 0, 0, 1), value = 0.)
+
+        depth_tokens = torch.cat((spatial_tokens, tokens_with_depth_pos), dim = -2)
+
+        depth_tokens = rearrange(depth_tokens, '... n d -> (...) n d')
+
+        depth_tokens = self.depth_transformer(depth_tokens) # (b * (s+1), d+1, f)
+
+        depth_tokens = rearrange(depth_tokens, '(b s) d f -> b s d f', b = b)
+
+        logits = torch.stack([layer(depth_tokens[:, :, i, :]) for i, layer in enumerate(self.to_logits)], dim=2) # (b, s+1, d, num_tokens)
+        logits = logits[:, :-1, :, :] # remove logits corresponding to last item (no ground truth)
+        preds = rearrange(logits, 'b s d f -> (b s d) f')
+
+        labels = ids.flatten() # (b * s * d,)
+
+        # adapt labels to multi-head projection layer
+        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
+        labels = torch.where(
+            labels==self.pad_id,
+            -100,
+            labels - offset.repeat(b*spatial_seq_len).to(labels.device) - self.num_special_tokens
+        )
+
+        loss = F.cross_entropy(preds, labels, ignore_index = -100)
+        return loss
+
+    def _get_logits_from_last_spatial_token(self, ids, attention_mask):
+        tokens_with_depth_pos, spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s+1, f)
+        #### logger.info("_get_logits_from_last_spatial_token: passed _spatial_forward")
+
+        # --- IMPORTANT: pad tokens_with_depth_pos exactly like the training path ---
+        tokens_with_depth_pos = F.pad(tokens_with_depth_pos, (0, 0, 0, 0, 0, 1), value=0.)  # -> (b, s+1, d, f)
+
+        # Now the spatial_tokens and tokens_with_depth_pos have the same spatial length
+        last_spatial_token = spatial_tokens[:, -1, :]            # (b, f)  # start token
+        # # print(f"_get_logits_from_last_spatial_token: last_spatial_token shape: {last_spatial_token.shape}")
+        # # print(f"_get_logits_from_last_spatial_token: last_spatial_token: \n{last_spatial_token}\n")
+        last_token_with_depth_pos = tokens_with_depth_pos[:, -1, :, :]  # (b, d, f) matched block - only keep the tokens with depth pos corresponding to the last spatial token
+        # # print(f"_get_logits_from_last_spatial_token: tokens_with_depth_pos after padding shape: {tokens_with_depth_pos.shape}")
+        # # print(f"_get_logits_from_last_spatial_token: last_spatial_token shape: {last_spatial_token.shape}")
+        depth_tokens = torch.cat((last_spatial_token[:, None, :], last_token_with_depth_pos), dim=1)  # (b, 1+d, f)
+        
+        depth_tokens = self.depth_transformer(depth_tokens) # (b, 1+d, f)
+        # # print(f"_get_logits_from_last_spatial_token: depth_tokens shape after depth transformer: {depth_tokens.shape}")
+        # # print(f"_get_logits_from_last_spatial_token: depth_tokens after depth transformer: \n{depth_tokens}\n")
+        #### logger.info("_get_logits_from_last_spatial_token: passed depth_transformer")
+
+        logits = torch.stack([layer(depth_tokens[:, i, :]) for i, layer in enumerate(self.to_logits)], dim=1) # (b, d, num_tokens)
+
+        return logits, b
+    
+    def generate(self, ids, attention_mask, topK=20, use_constraints=True):
+        # TODO: HANDLE OFFSET FOR MULTI-HEAD PROJECTION LAYER LATER
+        # TODO 2: If use constraints thing
+        assert (self.candidate_trie is not None) or not use_constraints, "You must set a candidate trie for constrained decoding if use_constraints is True"
+
+        # let's do step by step without a loop - then add a loop
+        tokens_with_depth_pos, spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s, d, f), (b, s+1, f), int, int
+        tokens_with_depth_pos = F.pad(tokens_with_depth_pos, (0, 0, 0, 0, 0, 1), value = 0.) # (b, s+1, d, f)
+        last_spatial_token = spatial_tokens[:, -1, :] # (b, f)
+        
+        # init depth transformer input: [start_token, depth_pos_0..n]
+        depth_tokens = [last_spatial_token[:, None, :]]  # start
+
+        # step 0
+        depth_out = self.depth_transformer(depth_tokens[0])  # (b, 1, f)
+        logits0 = self.to_logits[0](depth_out[:, -1, :])  # (b, num_tokens)
+        # logits0 = logits0 / temperature # if we decide to use sampling - for now we do greedy decoding
+        if not use_constraints:
+            valid_tokens = torch.zeros_like(logits0)
+        else:
+            valid_tokens = torch.full_like(logits0, float('-inf'))
+            for i in range(b):
+                valid_next_tokens = self.candidate_trie.get([]) # type: ignore[OptionalMemberAccess]
+                valid_tokens[i, valid_next_tokens] = 0.
+        print(f"generate - step 0 - valid_tokens mask non null number: {(valid_tokens!=0.).sum().item()}")
+        logits0 = logits0 + valid_tokens
+        log_probs0 = F.log_softmax(logits0, dim=-1)  # (b, num_tokens)
+        topk_vals, topk_idx = log_probs0.topk(topK, dim=-1)  # (b, topK)
+    
+        # Initialize beam state
+        beam_scores = topk_vals  # (b, topK)
+        beam_tokens = topk_idx.unsqueeze(-1)  # (b, topK, 1) -> prefixes
+
+        for step in range(1, self.depth_seq_len):
+            flat_tokens = beam_tokens.reshape(b * topK, step)  # (b*topK, step)
+            flat_scores = beam_scores.reshape(b * topK)        # (b*topK,)
+
+            depth_tokens = [last_spatial_token.repeat_interleave(topK, dim=0)[:, None, :]]  # (b*topK, 1, f)
+            for d in range(step):
+                token_emb = self.token_emb(flat_tokens[:, d])  # (b*topK, f)
+                pos_emb = self.depth_pos_emb(torch.tensor(d, device=token_emb.device))  # (f,)
+                depth_tokens.append((token_emb + pos_emb)[..., None, :])  # (b*topK, 1, f)
+            
+            depth_input = torch.cat(depth_tokens, dim=1)  # (b*topK, step+1, f)
+            depth_out = self.depth_transformer(depth_input)  # (b*topK, step+1, f)
+            logits = self.to_logits[step](depth_out[:, -1, :])  # (b*topK, num_tokens)
+
+            # mask logits based on candidate trie
+            if not use_constraints:
+                valid_mask = torch.zeros_like(logits)
+            else:
+                valid_mask = torch.full_like(logits, float('-inf'))
+                for beam_id in range(b * topK):
+                    prefix = flat_tokens[beam_id].tolist()
+                    prefix_w_offset = [p + self.num_special_tokens + (step * self.num_tokens) for step, p in enumerate(prefix)]
+                    valid_next_tokens = self.candidate_trie.get(prefix_w_offset) # type: ignore[OptionalMemberAccess]
+                    # reverse offset
+                    valid_next_tokens = [t % self.num_tokens - self.num_special_tokens for t in valid_next_tokens] # or t - step * self.num_tokens - self.num_special_tokens
+                    valid_mask[beam_id, valid_next_tokens] = 0.
+            print(f"generate - step {step} - valid_mask non null number: {(valid_mask!=0.).sum().item()}")
+            logits = logits + valid_mask
+            log_probs = F.log_softmax(logits, dim=-1)  # (b*topK, num_tokens)
+
+            # expand beams
+            next_vals, next_idx = log_probs.topk(topK, dim=-1)  # (b*topK, topK)
+
+            # add scores
+            cand_scores = flat_scores[:, None] + next_vals  # (b*topK, topK)
+            cand_tokens = torch.cat((flat_tokens[:, None, :].repeat(1, topK, 1), next_idx[..., None]), dim=-1)  # (b*topK, topK, step+1)
+
+            # reshape to (b, topK*topK)
+            cand_scores = cand_scores.view(b, topK * topK)  # (b, topK*topK)
+            cand_tokens = cand_tokens.view(b, topK * topK, -1)  # (b, topK*topK, step+1)
+
+            # prune to topK
+            beam_scores, beam_idx = cand_scores.topk(topK, dim=-1)  # (b, topK)
+            batch_idx = torch.arange(b, device=beam_tokens.device)[:, None]
+            beam_tokens = cand_tokens[batch_idx, beam_idx]  # (b, topK, step+1)
+            
+            # # or?
+            # beam_tokens = cand_tokens.gather(1, beam_idx.unsqueeze(-1).repeat(1, 1, cand_tokens.shape[-1]))  # (b, topK, step+1)
+
+        # add token offset back
+        offset = torch.arange(self.depth_seq_len, device=beam_tokens.device) * self.num_tokens
+        beam_tokens = beam_tokens + offset[None, None, :] + self.num_special_tokens
+
+        return {"sequences": beam_tokens, "sequences_scores": beam_scores}
+
+    def forward_validation(self, ids, attention_mask, labels):
+        # # print(f"forward: ids device: {ids.device}")
+        # # print(f"forward: attention_mask device: {attention_mask.device}")
+        # # print(f"forward: labels device: {labels.device}")
+        logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask) # (b, d, num_tokens)
+        preds = rearrange(logits, 'b d f -> (b d) f') # (b * d, num_tokens)
+        labels = labels.view(-1) # (b * d,)
+        # # print(f"forward_validation: preds shape: {preds.shape}")
+        # # print(f"forward_validation: labels shape: {labels.shape}")
+        # # print(f"forward_validation: preds: \n{preds}\n")
+        # # print(f"forward_validation: labels: \n{labels}\n")
+
+        # # print(f"forward_validation: ids[:10]: {ids[:10]}")
+        # # print(f"forward_validation: attention_mask[:10]: {attention_mask[:10]}")
+        # # print(f"forward_validation: labels[:10]: {labels[:10]}")
+
+        # adapt labels to multi-head projection layer
+        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
+        labels = labels - offset.repeat(b).to(labels.device) - self.num_special_tokens
+        # # print(f"forward_validation: labels after offset correction: \n{labels}\n")
+
+        # TODO: ADD CUSTOM LOSS COMPUTER (cf. T54Rec)
+        loss = F.cross_entropy(preds, labels, ignore_index = -100) # NB: there shouldn't be any padding in validation
+        return loss
+
+    # def forward_validation(self, ids, attention_mask, labels):
+    #     tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
+
+    #     spatial_tokens = rearrange(spatial_tokens, 'b s f -> b s 1 f')
+
+    #     # spatial tokens become the start tokens of the depth dimension
+    #     tokens_with_depth_pos = F.pad(tokens_with_depth_pos, (0, 0, 0, 0, 0, 1), value = 0.)
+
+    #     depth_tokens = torch.cat((spatial_tokens, tokens_with_depth_pos), dim = -2)
+
+    #     depth_tokens = rearrange(depth_tokens, '... n d -> (...) n d')
+
+    #     depth_tokens = self.depth_transformer(depth_tokens) # (b * (s+1), d+1, f)
+
+    #     depth_tokens = rearrange(depth_tokens, '(b s) d f -> b s d f', b = b)
+
+    #     # keep only the depth tokens corresponding to the last spatial token
+    #     depth_tokens = depth_tokens[:, -1, :, :] # (b, d, f)
+    #     print(f"forward_validation: depth_tokens shape after keeping only last spatial token: {depth_tokens.shape}")
+
+    #     # NOTE: CHANGING THE DIM HERE IS IMPORTANT
+    #     logits = torch.stack([layer(depth_tokens[:, i, :]) for i, layer in enumerate(self.to_logits)], dim=1) # (b, d, num_tokens)
+    #     print(f"forward_validation: logits shape: {logits.shape}")
+    #     preds = rearrange(logits, 'b d f -> (b d) f')
+        
+    #     labels = labels.view(-1) # (b * d,)
+
+    #     # adapt labels to multi-head projection layer
+    #     offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
+    #     labels = labels - offset.repeat(b).to(labels.device) - self.num_special_tokens
+
+    #     print(f"forward_validation: preds.shape: {preds.shape}")
+    #     print(f"forward_validation: labels.shape: {labels.shape}")
+
+    #     loss = F.cross_entropy(preds, labels, ignore_index = -100)
+    #     return loss
 
 
 class RQQTransformer(nn.Module):
@@ -555,7 +673,8 @@ class RQQTransformer(nn.Module):
         # Insert start token at the position of the last padding token for each batch element - also adapt attention mask
         spatial_tokens, spatial_attention_mask = self._insert_start_token(spatial_tokens, spatial_attention_mask, self.spatial_start_token) # (b, s+1, f), (b, s+1)
         # # print(f"_spatial_forward: spatial_tokens after inserting start token: \n{spatial_tokens}\n")
-        # # print(f"_spatial_forward: spatial_attention_mask after inserting start token: \n{spatial_attention_mask}\n")
+        # # print(f"_spatial_forward: spatial_attention_mask after inserting start token [:10]: \n{spatial_attention_mask[:10]}\n")
+        # # print(f"_spatial_forward: ids[:10]: \n{ids[:10]}\n")
         #### logger.info(f"_spatial_forward: passed _insert_start_token")
 
         spatial_tokens = self.spatial_transformer(spatial_tokens, spatial_attention_mask) # (b, s+1, f)
@@ -718,6 +837,25 @@ class LitRQQTransformer(pl.LightningModule):
         self.use_constraints = use_constraints
         # self.save_hyperparameters()
 
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+        scheduler = transformers.get_scheduler(
+            name=self.lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=int(self.trainer.estimated_stepping_batches)
+        )
+        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+    
+    def grad_norm(self, norm_type=2):
+        total_norm = 0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(norm_type)
+                total_norm += param_norm.item() ** norm_type
+        return total_norm ** (1. / norm_type)
+
     def training_step(self, batch, batch_idx):
         ids, attention_mask = batch["input_ids"], batch["attention_mask"]
         loss = self.model(ids, attention_mask)
@@ -729,18 +867,6 @@ class LitRQQTransformer(pl.LightningModule):
         loss = self.model.forward_validation(ids, attention_mask, labels)
         self.log("eval_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed)
         return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-
-        # Example: linear warmup
-        scheduler = transformers.get_scheduler(
-            name=self.lr_scheduler_type,
-            optimizer=optimizer,
-            num_warmup_steps=self.warmup_steps,
-            num_training_steps=int(self.trainer.estimated_stepping_batches)
-        )
-        return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
 
     def predict_step(self, batch, batch_idx):
         inputs, targets, users = batch

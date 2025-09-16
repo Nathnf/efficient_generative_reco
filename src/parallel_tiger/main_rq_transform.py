@@ -14,7 +14,9 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint, 
     EarlyStopping,
     ModelSummary,
-    TQDMProgressBar
+    TQDMProgressBar,
+    LearningRateMonitor,
+    Callback
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities.rank_zero import rank_zero_only # type: ignore[ReportPrivateImportUsage]
@@ -26,7 +28,7 @@ import logging
 from clearml import Task
 from tqdm import tqdm
 
-from parallel_tiger.model.RQ_Qt5 import RQQTransformer, LitRQQTransformer
+from parallel_tiger.model.RQ_Qt5 import RQTransformer, RQQTransformer, LitRQQTransformer
 from parallel_tiger.utils.misc import (
     set_seed,
 )
@@ -127,6 +129,11 @@ def initialize_logging_task(cfg: DictConfig) -> Optional[Tuple[Task, TensorBoard
         sys.modules["clearml"] = None # type: ignore[reportArgumentType]
         return None
 
+class GradNormLogger(Callback):
+    def on_after_backward(self, trainer, pl_module):
+        total_norm = pl_module.grad_norm(2)  # L2 norm
+        trainer.logger.log_metrics({"grad_norm": total_norm}, step=trainer.global_step)
+
 
 def train(cfg: DictConfig):
     result = initialize_logging_task(cfg)
@@ -149,7 +156,8 @@ def train(cfg: DictConfig):
     tokenizer.model_max_length = 512
     tokenizer.padding_side = "left"
 
-    model = RQQTransformer(
+    # model = RQQTransformer(
+    model = RQTransformer(
         num_tokens=cfg.code_num,
         dim=cfg.model.dim,
         max_spatial_seq_len=cfg.model.max_spatial_seq_len,
@@ -162,7 +170,7 @@ def train(cfg: DictConfig):
         ff_mult=cfg.model.ff_mult,
         ff_dropout=cfg.model.ff_dropout,
         pad_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-        attention_type=cfg.model.attention_type,
+        # attention_type=cfg.model.attention_type,
         num_special_tokens=len(tokenizer.special_tokens_map)
     )
 
@@ -200,9 +208,9 @@ def train(cfg: DictConfig):
         logger.info("Tokenizer number of tokens: {}".format(len(tokenizer.get_vocab())))
         tokenizer.save_pretrained(cfg.output_dir)
         logger.info("train sequence")
-        logger.info("{}".format(train_data[100]))
+        logger.info("{}".format(train_data[min(100, len(train_data) - 1)]))
         logger.info("val sequence")
-        logger.info("{}".format(valid_data[100]))
+        logger.info("{}".format(valid_data[min(100, len(valid_data) - 1)]))
         logger.info("{}".format(model))
         log_trainable_parameters(model)
 
@@ -233,8 +241,10 @@ def train(cfg: DictConfig):
         filename="best-checkpoint"
     )
     progress_bar = TQDMProgressBar(refresh_rate=100)
-    callbacks = [early_stopping, model_summary, checkpoint, progress_bar]
-    
+    lr_monitor = LearningRateMonitor(logging_interval='step')
+    grad_norm_logger = GradNormLogger()
+    callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger]
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices="auto",
@@ -283,7 +293,7 @@ def predict(
     logger.info(f"Test dataset size: {len(test_data)} sequences")
     all_items = test_data.get_all_items()
     logger.info("test sequence")
-    logger.info("{}".format(test_data[100]))
+    logger.info("{}".format(test_data[min(100, len(test_data) - 1)]))
 
     test_dataloader = DataLoader(
         test_data,
@@ -339,7 +349,7 @@ def gather_predictions(preds):
         all_preds = [None for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather_object(all_preds, preds)
         # flatten list of lists
-        all_preds = [p for sublist in all_preds for p in sublist]
+        all_preds = [p for sublist in all_preds for p in sublist] # type: ignore[reportGeneralTypeIssues]
     else:
         all_preds = preds
     return all_preds
@@ -381,6 +391,12 @@ def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, 
         decoded_outputs = tokenizer.batch_decode(
             output_ids, skip_special_tokens=True
         )
+        # print the first 10 decoded outputs as well as the corresponding targets
+        if step == 0:
+            for i in range(min(10, len(decoded_outputs))):
+                logger.info(f"Decoded output {i}: {decoded_outputs[i]}")
+                logger.info(f"Target {i}: {targets[i // cfg.infer.num_beams]}")
+                logger.info(f"User {i}: {users[i // cfg.infer.num_beams]}")
 
         # Now compute top-k results & metrics
         topk_res = get_topk_results(

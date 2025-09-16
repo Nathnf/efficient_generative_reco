@@ -39,6 +39,7 @@ train:
   tasks: "seqrec" # Downstream tasks, separate by comma
   valid_task: "seqrec"
   training_mode: "standard"
+  train_and_val_sample_num: -1 # Number of samples to use for training and validation, -1 means using all data - Useful to see if the model overfits on small data
 
   # # optim: "adamw_torch"
   # model_max_length: 2048

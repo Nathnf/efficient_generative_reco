@@ -31,6 +31,7 @@ class SeqRecDataset(BaseDataset):
 
         self.mode = mode
         self.prompt_id = prompt_id
+        self.train_and_val_sample_num = cfg.train.train_and_val_sample_num
         self.sample_num = sample_num
         self.train_data_mode = cfg.dataset.train_data_mode
         self.task = task
@@ -97,6 +98,20 @@ class SeqRecDataset(BaseDataset):
                 # new_items = [item_uid_to_token(i, n_tokens=self.num_id_tokens) for i in items]
                 new_items = [self.indices[str(i)] for i in items]
                 self.remapped_inters[uid] = new_items
+    
+    def _maybe_sample(self, inter_data, sample=False):
+        if self.train_and_val_sample_num > 0 and len(inter_data) > self.train_and_val_sample_num:
+            if sample:
+                all_idx = range(len(inter_data))
+                sample_idx = np.random.choice(all_idx, self.train_and_val_sample_num, replace=False)
+            else:
+                sample_idx = range(self.train_and_val_sample_num)
+            inter_data = np.array(inter_data, dtype=object)[sample_idx].tolist()
+
+            if self.train_and_val_sample_num < 11:
+                logger.info(f"Sampled data: {inter_data}")
+                logger.info(f"Sampled data length: {len(inter_data)}")
+        return inter_data
 
     def _process_train_data(self):
         """
@@ -123,7 +138,7 @@ class SeqRecDataset(BaseDataset):
                 "inters": history_items
             })
 
-        return inter_data
+        return self._maybe_sample(inter_data)
 
     def _process_valid_data(self):
 
@@ -132,15 +147,15 @@ class SeqRecDataset(BaseDataset):
             items = self.remapped_inters[uid]
             one_data = dict()
             # one_data["user"] = uid
-            one_data["item"] = items[-2]
-            history = items[:-2]
+            one_data["item"] = items[-2]    # NB: Put -3 if we want to see if the model can overfit validation data
+            history = items[:-2]            # idem
             if self.max_his_len > 0:
                 history = history[-self.max_his_len :]
 
             one_data["inters"] = history
             inter_data.append(one_data)
 
-        return inter_data
+        return self._maybe_sample(inter_data)
 
     def _process_test_data(self):
 

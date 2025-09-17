@@ -32,6 +32,7 @@ class SeqRecDataset(BaseDataset):
         self.mode = mode
         self.prompt_id = prompt_id
         self.train_and_val_sample_num = cfg.train.train_and_val_sample_num
+        self.overfit_val = cfg.train.overfit_val
         self.sample_num = sample_num
         self.train_data_mode = cfg.dataset.train_data_mode
         self.task = task
@@ -99,13 +100,14 @@ class SeqRecDataset(BaseDataset):
                 new_items = [self.indices[str(i)] for i in items]
                 self.remapped_inters[uid] = new_items
     
-    def _maybe_sample(self, inter_data, sample=False):
+    def _maybe_sample(self, inter_data):
         if self.train_and_val_sample_num > 0 and len(inter_data) > self.train_and_val_sample_num:
-            if sample:
+            if self.overfit_val:
+                # same training and validation sequences
+                sample_idx = range(self.train_and_val_sample_num)
+            else:
                 all_idx = range(len(inter_data))
                 sample_idx = np.random.choice(all_idx, self.train_and_val_sample_num, replace=False)
-            else:
-                sample_idx = range(self.train_and_val_sample_num)
             inter_data = np.array(inter_data, dtype=object)[sample_idx].tolist()
 
             if self.train_and_val_sample_num < 11:
@@ -147,8 +149,9 @@ class SeqRecDataset(BaseDataset):
             items = self.remapped_inters[uid]
             one_data = dict()
             # one_data["user"] = uid
-            one_data["item"] = items[-2]    # NB: Put -3 if we want to see if the model can overfit validation data
-            history = items[:-2]            # idem
+            index = -2 if not self.overfit_val else -3
+            one_data["item"] = items[index]
+            history = items[:index]
             if self.max_his_len > 0:
                 history = history[-self.max_his_len :]
 

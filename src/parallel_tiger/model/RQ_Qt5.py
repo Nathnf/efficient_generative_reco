@@ -10,6 +10,14 @@ from parallel_tiger.generation.trie import Trie
 import logging
 logger = logging.getLogger(__name__)
 
+# helper functions 
+
+def safe_log_softmax(logits, dim=-1):
+    row_invalid = (logits == float('-inf')).all(dim=dim)
+    log_probs = F.log_softmax(logits, dim=dim)
+    log_probs[row_invalid] = -float("inf")
+    return log_probs
+
 # helper classes
 
 def FeedForward(*, dim, mult = 4, dropout = 0.):
@@ -113,7 +121,8 @@ class RQTransformer(nn.Module):
         ff_mult = 4,
         ff_dropout = 0.,
         pad_id = 0,
-        num_special_tokens = 4
+        num_special_tokens = 4,
+        attention_type = None
     ):
         super().__init__()
         self.dim = dim
@@ -205,11 +214,8 @@ class RQTransformer(nn.Module):
 
     def _spatial_forward(self, ids, attention_mask):
         # require flattened input for compability with MQL4GRec data collator
-        assert ids.ndim == 2 # ids: (b, spatial_seq_len * d)
-        assert attention_mask.ndim == 2 # attention_mask: (b, spatial_seq_len * d)
-
-        ids = rearrange(ids, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
-        attention_mask = rearrange(attention_mask, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
+        assert ids.ndim == 3 # ids: (b, s, d)
+        assert attention_mask.ndim == 3 # attention_mask: (b, s, d)
 
         b, spatial_seq_len, depth, device = *ids.shape, ids.device
         assert spatial_seq_len <= (self.max_spatial_seq_len + 1), f'spatial dimension ({spatial_seq_len}) is greater than the max_spatial_seq_len set ({self.max_spatial_seq_len + 1})'
@@ -261,7 +267,7 @@ class RQTransformer(nn.Module):
 
         return tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len
 
-    def forward(self, ids, attention_mask):
+    def forward(self, ids, attention_mask, *args):
         tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
 
         spatial_tokens = rearrange(spatial_tokens, 'b s f -> b s 1 f')
@@ -292,7 +298,7 @@ class RQTransformer(nn.Module):
         )
 
         loss = F.cross_entropy(preds, labels, ignore_index = -100)
-        return loss
+        return loss, None
 
     def _get_logits_from_last_spatial_token(self, ids, attention_mask):
         tokens_with_depth_pos, spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s+1, f)
@@ -343,9 +349,13 @@ class RQTransformer(nn.Module):
             for i in range(b):
                 valid_next_tokens = self.candidate_trie.get([]) # type: ignore[OptionalMemberAccess]
                 valid_tokens[i, valid_next_tokens] = 0.
-        print(f"generate - step 0 - valid_tokens mask non null number: {(valid_tokens!=0.).sum().item()}")
+        # # print(f"generate - step 0 - valid_tokens mask non null number: {(valid_tokens!=0.).sum().item()}")
+        # # print(f"generate - step 0 - before masking - logits min: {logits0.min().item()}, max: {logits0.max().item()}")
         logits0 = logits0 + valid_tokens
-        log_probs0 = F.log_softmax(logits0, dim=-1)  # (b, num_tokens)
+        # # print(f"generate - step 0 - after masking - logits min: {logits0.min().item()}, max: {logits0.max().item()}")
+        # log_probs0 = F.log_softmax(logits0, dim=-1)  # (b, num_tokens)
+        log_probs0 = safe_log_softmax(logits0, dim=-1)  # (b, num_tokens)
+        # # print(f"generate - step 0 - log_probs min: {log_probs0.min().item()}, max: {log_probs0.max().item()}, any nan: {torch.isnan(log_probs0).any().item()}")
         topk_vals, topk_idx = log_probs0.topk(topK, dim=-1)  # (b, topK)
     
         # Initialize beam state
@@ -378,9 +388,13 @@ class RQTransformer(nn.Module):
                     # reverse offset
                     valid_next_tokens = [t % self.num_tokens - self.num_special_tokens for t in valid_next_tokens] # or t - step * self.num_tokens - self.num_special_tokens
                     valid_mask[beam_id, valid_next_tokens] = 0.
-            print(f"generate - step {step} - valid_mask non null number: {(valid_mask!=0.).sum().item()}")
+            # # print(f"generate - step {step} - valid_mask non null number: {(valid_mask!=0.).sum().item()}")
+            # # print(f"generate - step {step} - before masking - logits min: {logits.min().item()}, max: {logits.max().item()}")
             logits = logits + valid_mask
-            log_probs = F.log_softmax(logits, dim=-1)  # (b*topK, num_tokens)
+            # # print(f"generate - step {step} - after masking - logits min: {logits.min().item()}, max: {logits.max().item()}")
+            # log_probs = F.log_softmax(logits, dim=-1)  # (b*topK, num_tokens)
+            log_probs = safe_log_softmax(logits, dim=-1)  # (b*topK, num_tokens)
+            # # print(f"generate - step {step} - log_probs min: {log_probs.min().item()}, max: {log_probs.max().item()}, any nan: {torch.isnan(log_probs).any().item()}")
 
             # expand beams
             next_vals, next_idx = log_probs.topk(topK, dim=-1)  # (b*topK, topK)
@@ -407,7 +421,7 @@ class RQTransformer(nn.Module):
 
         return {"sequences": beam_tokens, "sequences_scores": beam_scores}
 
-    def forward_validation(self, ids, attention_mask, labels):
+    def forward_validation(self, ids, attention_mask, labels, *args):
         # # print(f"forward: ids device: {ids.device}")
         # # print(f"forward: attention_mask device: {attention_mask.device}")
         # # print(f"forward: labels device: {labels.device}")
@@ -430,7 +444,7 @@ class RQTransformer(nn.Module):
 
         # TODO: ADD CUSTOM LOSS COMPUTER (cf. T54Rec)
         loss = F.cross_entropy(preds, labels, ignore_index = -100) # NB: there shouldn't be any padding in validation
-        return loss
+        return loss, None
 
     # def forward_validation(self, ids, attention_mask, labels):
     #     tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
@@ -626,13 +640,65 @@ class RQQTransformer(nn.Module):
         assert torch.equal(spatial_tokens_extended, spatial_tokens_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for spatial_tokens"
         assert torch.equal(attention_mask_extended, attention_mask_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for attention_mask"
 
+    def _compute_loss_with_mask(
+        self,
+        preds,
+        labels,
+        use_query_vectors_mask,
+        depth_seq_len,
+        # spatial_seq_len=None,
+    ):
+        """
+        Compute the cross-entropy loss with optional masking of certain query vectors.
+        Adapted to both training case (b, s, d) and validation case (b, d).
+
+        preds: (N, num_tokens) where N = b*d or b*s*d
+        labels: (N,)
+        use_query_vectors_mask: None, or (b, d) / (b, s, d)
+        depth_seq_len: int
+        spatial_seq_len: int or None (if present, use (b, s, d) mode)
+        """
+
+        if use_query_vectors_mask is not None:
+            use_query_vectors_mask_flat = use_query_vectors_mask.flatten()
+            labels = torch.where(
+                use_query_vectors_mask_flat,
+                labels,
+                -100
+            )
+
+            # compute loss weights normalized per sample
+            num_masked_per_sample = use_query_vectors_mask.sum(dim=-1)  # (b,) or (b, s)
+            loss_weights = torch.where(
+                use_query_vectors_mask,
+                1.0 / num_masked_per_sample.unsqueeze(-1).float(),  # safe by construction
+                0.0
+            ).flatten()
+        else:
+            loss_weights = torch.ones_like(labels, dtype=torch.float32)
+
+        loss = F.cross_entropy(
+            preds, labels, ignore_index=-100, reduction="none"
+        ) * loss_weights
+
+        # if spatial_seq_len is None:
+        #     # case (b, d)
+        #     b = labels.shape[0] // depth_seq_len
+        #     loss_per_codebook = loss.view(b, depth_seq_len).sum(dim=0)  # (d,)
+        # else:
+        #     # case (b, s, d)
+        #     b = labels.shape[0] // (spatial_seq_len * depth_seq_len)
+        #     loss_per_codebook = loss.view(b * spatial_seq_len, depth_seq_len).sum(dim=0)  # (d,)
+        loss_per_codebook = loss.view(-1, depth_seq_len).sum(dim=0)  # (d,)
+        norm_factor = preds.size(0) if use_query_vectors_mask is None else use_query_vectors_mask.sum().item()
+        loss_per_codebook = loss_per_codebook / norm_factor
+
+        return loss.mean(), loss_per_codebook
+
     def _spatial_forward(self, ids, attention_mask):
         # require flattened input for compability with MQL4GRec data collator
-        assert ids.ndim == 2 # ids: (b, spatial_seq_len * d)
-        assert attention_mask.ndim == 2 # attention_mask: (b, spatial_seq_len * d)
-
-        ids = rearrange(ids, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
-        attention_mask = rearrange(attention_mask, 'b (s d) -> b s d', d = self.depth_seq_len) # (b, spatial_seq_len, d)
+        assert ids.ndim == 3 # ids: (b, s, d)
+        assert attention_mask.ndim == 3 # attention_mask: (b, s, d)
 
         b, spatial_seq_len, depth, device = *ids.shape, ids.device
         assert spatial_seq_len <= (self.max_spatial_seq_len + 1), f'spatial dimension ({spatial_seq_len}) is greater than the max_spatial_seq_len set ({self.max_spatial_seq_len + 1})'
@@ -668,8 +734,6 @@ class RQQTransformer(nn.Module):
         # # print(f"_spatial_forward: spatial_attention_mask shape: {spatial_attention_mask.shape}")
         # # print(f"_spatial_forward: spatial_attention_mask: \n{spatial_attention_mask}\n")
 
-        # replace every spatial pad token by the start token
-        # spatial_tokens[~spatial_attention_mask] = self.spatial_start_token # NB: can't simply do that because we remove the shifting --> model not autoregressive anymore
         # Insert start token at the position of the last padding token for each batch element - also adapt attention mask
         spatial_tokens, spatial_attention_mask = self._insert_start_token(spatial_tokens, spatial_attention_mask, self.spatial_start_token) # (b, s+1, f), (b, s+1)
         # # print(f"_spatial_forward: spatial_tokens after inserting start token: \n{spatial_tokens}\n")
@@ -682,18 +746,36 @@ class RQQTransformer(nn.Module):
         # # print(f"_spatial_forward: spatial_tokens after transformer: \n{spatial_tokens}\n")
         #### logger.info(f"_spatial_forward: passed spatial_transformer")
 
-        return spatial_tokens, b, spatial_seq_len
+        return tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len
 
-    def forward(self, ids, attention_mask):
+    def forward(self, ids, attention_mask, use_query_vectors_mask=None):
+        # if use_query_vectors_mask is not None:
+        # --> boolean mask of shape (b, s, d), with:
+        #   - True: masked --> model predicts this token and uses the query vector
+        #   - False: unmasked --> model is given the ground truth token and does not compute a loss on this token
+
         assert ids.numel() > 0, "Input ids cannot be empty"
         # # print(f"forward: ids device: {ids.device}")
         # # print(f"forward: attention_mask device: {attention_mask.device}")
 
-        spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
+        tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s, d, f), (b, s+1, f), int, int
 
         spatial_tokens = rearrange(spatial_tokens, 'b s f -> b s 1 f')
 
         depth_queries = repeat(self.depth_queries, 'd f -> b s d f', b = b, s=spatial_tokens.shape[1])
+
+        if use_query_vectors_mask is not None:
+            assert use_query_vectors_mask.shape == ids.shape, "use_query_vectors_mask must have the same shape as ids"
+            # replace the tokens in ids where use_query_vectors_mask is False to ground truth tokens
+            mask = use_query_vectors_mask.unsqueeze(-1)
+            # # print(f"forward: use_query_vectors_mask.unsqueeze(-1) shape: {use_query_vectors_mask.unsqueeze(-1).shape}")
+            # # print(f"forward: depth_queries shape: {depth_queries.shape}")
+            # # print(f"forward: tokens_with_depth_pos shape: {tokens_with_depth_pos.shape}")
+            depth_queries_items = depth_queries[:, :-1, :, :] # (b, s, d, f) # remove last item (no ground truth)
+            # # print(f"forward: depth_queries_items shape (after removing last item): {depth_queries_items.shape}")
+            depth_queries_items = torch.where(mask, depth_queries_items, tokens_with_depth_pos)
+            depth_queries = torch.cat((depth_queries_items, depth_queries[:, -1:, :, :]), dim=1) # (b, s+1, d, f) # add back last item (will be discarded later)
+            # NOTE: Should we already discard the last item here (we don'rt have its ground truth) ? Or is it better to keep it for the depth transformer (more context) and discard it later ?
 
         depth_tokens = torch.cat((spatial_tokens, depth_queries), dim=2) # (b, s+1, 1+d, f)
         # # print(f"forward: depth_tokens shape before depth transformer: {depth_tokens.shape}")
@@ -741,12 +823,16 @@ class RQQTransformer(nn.Module):
         )
         # # print(f"forward: labels after offset correction: \n{labels}\n")
 
-        # TODO: ADD CUSTOM LOSS COMPUTER (cf. T54Rec)
-        loss = F.cross_entropy(preds, labels, ignore_index = -100)
-        return loss
+        loss, loss_per_codebook = self._compute_loss_with_mask(
+            preds,
+            labels,
+            use_query_vectors_mask,
+            self.depth_seq_len,
+        )
+        return loss, loss_per_codebook
 
-    def _get_logits_from_last_spatial_token(self, ids, attention_mask):
-        spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s+1, f)
+    def _get_logits_from_last_spatial_token(self, ids, attention_mask, use_query_vectors_mask=None):
+        tokens_with_depth_pos, spatial_tokens, b, _ = self._spatial_forward(ids, attention_mask) # (b, s, d, f), (b, s+1, f), int, int
         #### logger.info("_get_logits_from_last_spatial_token: passed _spatial_forward")
 
         last_spatial_token = spatial_tokens[:, -1, :] # (b, f) # only keep the last spatial token
@@ -756,6 +842,14 @@ class RQQTransformer(nn.Module):
 
         last_spatial_token = last_spatial_token[:, None, None, :]
         depth_queries = repeat(self.depth_queries, 'd f -> b 1 d f', b = b)
+
+        if use_query_vectors_mask is not None:
+            # replace the tokens in ids where use_query_vectors_mask is False to ground truth tokens
+            mask = use_query_vectors_mask[:, None, :, None] # (b, 1, d, 1)
+            gt_embeddings = tokens_with_depth_pos[:, -1, :, :][:, None, :, :] # (b, 1, d, f) - ground truth embeddings corresponding to the last spatial token
+            depth_queries = torch.where(mask, depth_queries, gt_embeddings)
+            #### logger.info("_get_logits_from_last_spatial_token: passed use_query_vectors_mask application")
+
         depth_tokens = torch.cat((last_spatial_token, depth_queries), dim=2) # (b, 1, 1+d, f)
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens shape before squeezing: {depth_tokens.shape}")
         # # print(f"_get_logits_from_last_spatial_token: depth_tokens before squeezing: \n{depth_tokens}\n")
@@ -784,11 +878,13 @@ class RQQTransformer(nn.Module):
         logits, _ = self._get_logits_from_last_spatial_token(ids, attention_mask) # (b, d, num_tokens)
         return logits
 
-    def forward_validation(self, ids, attention_mask, labels):
+    def forward_validation(self, ids, attention_mask, labels, use_query_vectors_mask=None):
+        if use_query_vectors_mask is not None:
+            assert use_query_vectors_mask.shape == labels.shape, "use_query_vectors_mask must have the same shape as labels = (b, d)"
         # # print(f"forward: ids device: {ids.device}")
         # # print(f"forward: attention_mask device: {attention_mask.device}")
         # # print(f"forward: labels device: {labels.device}")
-        logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask) # (b, d, num_tokens)
+        logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask, use_query_vectors_mask) # (b, d, num_tokens)
         preds = logits.view(-1, logits.size(-1)) # (b * d, num_tokens)
         labels = labels.view(-1) # (b * d,)
         # # print(f"forward_validation: preds shape: {preds.shape}")
@@ -801,9 +897,13 @@ class RQQTransformer(nn.Module):
         labels = labels - offset.repeat(b).to(labels.device) - self.num_special_tokens
         # # print(f"forward_validation: labels after offset correction: \n{labels}\n")
 
-        # TODO: ADD CUSTOM LOSS COMPUTER (cf. T54Rec)
-        loss = F.cross_entropy(preds, labels, ignore_index = -100) # NB: there shouldn't be any padding in validation
-        return loss
+        loss, loss_per_codebook = self._compute_loss_with_mask(
+            preds,
+            labels,
+            use_query_vectors_mask,
+            self.depth_seq_len,
+        )
+        return loss, loss_per_codebook
 
     def generate(self, ids, attention_mask, topK=20, use_constraints=True):
         logits = self.forward_inference(ids, attention_mask)
@@ -824,7 +924,7 @@ class LitRQQTransformer(pl.LightningModule):
         warmup_steps=100, 
         distributed=True,
         topK=20,
-        use_constraints=True
+        use_constraints=True,
     ):
         super().__init__()
         self.model = model
@@ -857,22 +957,26 @@ class LitRQQTransformer(pl.LightningModule):
         return total_norm ** (1. / norm_type)
 
     def training_step(self, batch, batch_idx):
-        ids, attention_mask = batch["input_ids"], batch["attention_mask"]
-        loss = self.model(ids, attention_mask)
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed)
+        ids, attention_mask, use_query_vectors_mask = batch["input_ids"], batch["attention_mask"], batch["use_query_vectors_mask"]
+        loss, loss_per_codebook = self.model(ids, attention_mask, use_query_vectors_mask)
+        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed, batch_size=ids.size(0))
+        # for i, l in enumerate(loss_per_codebook): # creates a graph per codebook on ClearML...
+        #     self.log(f"train_loss_codebook_{i+1}", l, prog_bar=False, on_step=False, on_epoch=True, sync_dist=self.distributed)
+        self.loss_per_codebook = loss_per_codebook # to be fetched by a custom ClearML callback
         return loss
 
     def validation_step(self, batch, batch_idx):
-        ids, attention_mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
-        loss = self.model.forward_validation(ids, attention_mask, labels)
-        self.log("eval_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed)
+        ids, attention_mask, labels, use_query_vectors_mask = batch["input_ids"], batch["attention_mask"], batch["labels"], batch["use_query_vectors_mask"]
+        loss, loss_per_codebook = self.model.forward_validation(ids, attention_mask, labels, use_query_vectors_mask)
+        self.log("eval_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed, batch_size=ids.size(0))
+        # for i, l in enumerate(loss_per_codebook): # idem
+        #     self.log(f"eval_loss_codebook_{i+1}", l, prog_bar=False, on_step=False, on_epoch=True, sync_dist=self.distributed)
+        self.loss_per_codebook = loss_per_codebook # idem
         return loss
 
     def predict_step(self, batch, batch_idx):
         inputs, targets, users = batch
         ids, attention_mask = inputs["input_ids"], inputs["attention_mask"]
-
-        #### logger.info(f"predict_step: ids device: {ids.device}")
 
         output = self.model.generate(
             ids,

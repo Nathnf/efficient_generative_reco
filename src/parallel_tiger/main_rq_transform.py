@@ -135,6 +135,63 @@ class GradNormLogger(Callback):
         trainer.logger.log_metrics({"grad_norm": total_norm}, step=trainer.global_step)
 
 
+class ClearMLCodebookLogger(Callback):
+    """
+    Logs per-codebook losses to a single ClearML graph.
+    Works for training and validation.
+    Collects `loss_per_codebook` from the module at epoch end.
+    """
+
+    def __init__(self, title="codebook_loss", mode="train"):
+        """
+        Args:
+            title (str): ClearML graph title
+            mode (str): "train" or "val" for prefixing series
+        """
+        super().__init__()
+        self.title = title
+        self.mode = mode
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.mode != "train":
+            return
+        self._report_codebook_losses(trainer, pl_module)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.mode != "val":
+            return
+        self._report_codebook_losses(trainer, pl_module)
+
+    def _report_codebook_losses(self, trainer, pl_module):
+        # Ensure ClearML task exists
+        task = Task.current_task()
+        if task is None:
+            return
+
+        # Collect loss_per_codebook from the module
+        if hasattr(pl_module, "loss_per_codebook"):
+            loss_per_codebook = pl_module.loss_per_codebook
+        else:
+            # Fallback: try from trainer.callback_metrics
+            loss_per_codebook = trainer.callback_metrics.get("loss_per_codebook", None)
+
+        if loss_per_codebook is None:
+            return
+
+        # Convert to CPU and numpy
+        if isinstance(loss_per_codebook, torch.Tensor):
+            loss_per_codebook = loss_per_codebook.detach().cpu().numpy()
+
+        # Report each codebook line to the same ClearML graph
+        for i, val in enumerate(loss_per_codebook):
+            task.get_logger().report_scalar(
+                title=f"{self.title}_per_epoch",
+                series=f"{self.mode}_codebook_{i+1}",
+                value=float(val),
+                iteration=trainer.current_epoch,
+            )
+
+
 def train(cfg: DictConfig):
     result = initialize_logging_task(cfg)
     task, tb_logger = result if result is not None else (None, None)
@@ -156,8 +213,8 @@ def train(cfg: DictConfig):
     tokenizer.model_max_length = 512
     tokenizer.padding_side = "left"
 
-    # model = RQQTransformer(
-    model = RQTransformer(
+    model_cls = RQQTransformer if cfg.get("model_type", "rqqt").lower() == "rqqt" else RQTransformer
+    model = model_cls(
         num_tokens=cfg.code_num,
         dim=cfg.model.dim,
         max_spatial_seq_len=cfg.model.max_spatial_seq_len,
@@ -170,7 +227,7 @@ def train(cfg: DictConfig):
         ff_mult=cfg.model.ff_mult,
         ff_dropout=cfg.model.ff_dropout,
         pad_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
-        # attention_type=cfg.model.attention_type,
+        attention_type=cfg.model.attention_type,
         num_special_tokens=len(tokenizer.special_tokens_map)
     )
 
@@ -213,6 +270,7 @@ def train(cfg: DictConfig):
         logger.info("{}".format(valid_data[min(100, len(valid_data) - 1)]))
         logger.info("{}".format(model))
         log_trainable_parameters(model)
+        logger.debug("Model state dict at initialization: \n{}".format(model.state_dict()))
 
     pl_module = LitRQQTransformer(
         model=model,
@@ -243,7 +301,9 @@ def train(cfg: DictConfig):
     progress_bar = TQDMProgressBar(refresh_rate=100)
     lr_monitor = LearningRateMonitor(logging_interval='step')
     grad_norm_logger = GradNormLogger()
-    callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger]
+    codebook_logger_train = ClearMLCodebookLogger(title="train_codebook_loss", mode="train")
+    codebook_logger_val = ClearMLCodebookLogger(title="val_codebook_loss", mode="val")
+    callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger, codebook_logger_train, codebook_logger_val]
 
     trainer = pl.Trainer(
         accelerator="gpu",
@@ -275,6 +335,9 @@ def train(cfg: DictConfig):
 
     pl_module.load_state_dict(torch.load(checkpoint.best_model_path)["state_dict"])
     # TODO: save model as well (or already done by checkpoint?)
+
+    if local_rank == 0:
+        logger.debug("Model state dict after training: \n{}".format(model.state_dict()))
 
     if task is not None:
         task.get_logger().report_single_value('training_time', training_time)
@@ -391,12 +454,6 @@ def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, 
         decoded_outputs = tokenizer.batch_decode(
             output_ids, skip_special_tokens=True
         )
-        # print the first 10 decoded outputs as well as the corresponding targets
-        if step == 0:
-            for i in range(min(10, len(decoded_outputs))):
-                logger.info(f"Decoded output {i}: {decoded_outputs[i]}")
-                logger.info(f"Target {i}: {targets[i // cfg.infer.num_beams]}")
-                logger.info(f"User {i}: {users[i // cfg.infer.num_beams]}")
 
         # Now compute top-k results & metrics
         topk_res = get_topk_results(

@@ -3,9 +3,10 @@ n_query: 4
 code_num: 256
 quantizer_type: "rqvae"
 project_name: "Parallel_RQ_Transformer"
+model_type: "rqqt" # "rqt" or "rqqt"
 
 exp_name: ???  # To be set from shell script
-output_dir: "./log/${project_name}/${dataset.name}/${quantizer_type}/${exp_name}"
+output_dir: "./log/${project_name}/${model_type}/${dataset.name}/${quantizer_type}/${exp_name}"
 enable_clearml: true
 
 dataset: 
@@ -21,6 +22,7 @@ dataset:
   add_prompt: False # Add prompt to the input
 
 train: 
+  training_mode: "standard"
   batch_size: 1024 # 2048 slightly too large for 2 V100 GPUs on the Arts dataset
   batch_size_eval: 2048
   learning_rate: 1e-2
@@ -38,8 +40,8 @@ train:
   limit_val_batches: 1.0 # full validation 
   tasks: "seqrec" # Downstream tasks, separate by comma
   valid_task: "seqrec"
-  training_mode: "standard"
   train_and_val_sample_num: -1 # Number of samples to use for training and validation, -1 means using all data - Useful to see if the model overfits on small data
+  overfit_val: false # Whether to try to overfit validation data (for debugging purposes)
 
   # # optim: "adamw_torch"
   # model_max_length: 2048
@@ -65,6 +67,7 @@ model:
   ff_mult: 4
   ff_dropout: 0.1
   attention_type: "full"
+  
 
 infer: 
   metrics: "hit@1,hit@5,hit@10,ndcg@5,ndcg@10"  # test metrics, separate by comma
@@ -90,10 +93,11 @@ infer:
 
 hydra:
   run:
-    dir: "./outputs/${project_name}/${dataset.name}/${quantizer_type}/${exp_name}/run/${now:%Y-%m-%d_%H-%M-%S}"
+    dir: "./outputs/${project_name}/${model_type}/${dataset.name}/${quantizer_type}/${exp_name}/run/${now:%Y-%m-%d_%H-%M-%S}"
   sweep:
-    dir: "./outputs/${project_name}/${dataset.name}/${quantizer_type}/${exp_name}/multirun/${now:%Y-%m-%d_%H-%M-%S}"
-    subdir: v${hydra.job.num}_${hydra.job.override_dirname}
+    dir: "./outputs/${project_name}/${model_type}/${dataset.name}/${quantizer_type}/${exp_name}/multirun/${now:%Y-%m-%d_%H-%M-%S}"
+    # subdir: v${hydra.job.num}_${hydra.job.override_dirname} # file name too long error
+    subdir: v${hydra.job.num}
   job_logging:
     version: 1
     root:
@@ -103,10 +107,6 @@ hydra:
       console:
         class: logging.StreamHandler
         formatter: simple
-      # file:
-      #   class: logging.FileHandler
-      #   formatter: simple
-      #   filename: main_job.log
     formatters:
       simple:
         format: "[%(asctime)s] [%(name)s] [%(levelname)s] - %(message)s"

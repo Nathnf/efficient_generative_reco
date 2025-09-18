@@ -44,7 +44,7 @@ def gather_list(target, world_size):
 
     all_device_target = []
     for target_list in target_gather_list:
-        all_device_target += target_list
+        all_device_target += target_list # type: ignore[reportOperatorIssue]
 
     return all_device_target
 
@@ -86,7 +86,7 @@ def test_ddp(cfg: DictConfig):
             task.set_parent(train_tasks[0])
         task.connect(OmegaConf.to_container(cfg))
     else:
-        sys.modules["clearml"] = None
+        sys.modules["clearml"] = None # type: ignore[reportArgumentType]
 
     tokenizer = CustomT5Tokenizer.from_pretrained(
         cfg.infer.ckpt_dir,

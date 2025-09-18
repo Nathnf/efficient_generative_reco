@@ -53,7 +53,7 @@ def train(cfg: DictConfig):
         logger.info(f"Task ID: {task.id}")
         task.connect(OmegaConf.to_container(cfg))
     else:
-        sys.modules["clearml"] = None
+        sys.modules["clearml"] = None # type: ignore[reportArgumentType]
 
     set_seed(cfg.seed)
     ensure_dir(cfg.output_dir)

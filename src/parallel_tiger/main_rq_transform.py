@@ -131,6 +131,7 @@ def initialize_logging_task(cfg: DictConfig) -> Optional[Tuple[Task, TensorBoard
 
 class GradNormLogger(Callback):
     def on_after_backward(self, trainer, pl_module):
+        assert trainer.logger is not None
         total_norm = pl_module.grad_norm(2)  # L2 norm
         trainer.logger.log_metrics({"grad_norm": total_norm}, step=trainer.global_step)
 

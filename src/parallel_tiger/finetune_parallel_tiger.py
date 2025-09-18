@@ -84,7 +84,7 @@ def train(cfg: DictConfig):
         logger.info(f"Task ID: {task.id}")
         task.connect(OmegaConf.to_container(cfg))
     else:
-        sys.modules["clearml"] = None
+        sys.modules["clearml"] = None # type: ignore[reportArgumentType]
 
     set_seed(cfg.seed)
     ensure_dir(cfg.output_dir)
@@ -163,8 +163,8 @@ def train(cfg: DictConfig):
         log_trainable_parameters(model)
 
     if not ddp and torch.cuda.device_count() > 1:
-        model.is_parallelizable = True
-        model.model_parallel = True
+        model.is_parallelizable = True  # type: ignore[reportArgumentType]
+        model.model_parallel = True     # type: ignore[reportArgumentType]
 
     early_stop = EarlyStoppingCallback(early_stopping_patience=cfg.train.patient)
     callbacks: List[TrainerCallback] = [early_stop]

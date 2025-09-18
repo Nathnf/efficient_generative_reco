@@ -28,7 +28,9 @@ import logging
 from clearml import Task
 from tqdm import tqdm
 
-from parallel_tiger.model.RQ_Qt5 import RQTransformer, RQQTransformer, LitRQQTransformer
+from parallel_tiger.model.base_rq_transformer import LitRQQTransformer
+from parallel_tiger.model.rq_transformer import RQTransformer
+from parallel_tiger.model.rqq_transformer import RQQTransformer
 from parallel_tiger.utils.misc import (
     set_seed,
 )
@@ -56,34 +58,6 @@ from parallel_tiger.evaluation.metrics import get_metrics_results, get_topk_resu
 logging.getLogger("fsspec").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-
-# TODO: make it compatible with RQ model [LATER]
-# def compute_metrics(eval_pred):
-#     predictions, _ = eval_pred
-#     # Assuming model returns codebook losses in hidden_states
-#     # Extract per-codebook losses from predictions (actually model outputs)
-#     if isinstance(predictions, tuple):
-#         _, codebook_losses = predictions
-#     else:
-#         _ = predictions
-#         codebook_losses = None  # Handle safely in case
-
-#     metrics = {}
-#     if codebook_losses is not None:
-#         codebook_losses_array = np.array(codebook_losses)
-#         codebook_losses = torch.from_numpy(codebook_losses_array).float().cpu()
-
-#         n_query = 4  # number of codebooks
-#         # Reshape: each row is one sample, each column is a codebook
-#         codebook_losses = codebook_losses.view(-1, n_query)
-
-#         # Compute mean per codebook
-#         means = codebook_losses.mean(dim=0)
-
-#         for i in range(n_query):
-#             metrics[f"codebook_loss_{i+1}"] = means[i].item()
-
-#     return metrics
 
 
 @rank_zero_only

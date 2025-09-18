@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from clearml import Task
 
-from parallel_tiger.model.model_t5 import T54Rec
+from transformers import T5ForConditionalGeneration
 from parallel_tiger.tokenizer.custom_tokenizer import CustomT5Tokenizer
 from parallel_tiger.model.config import ModelConfig
 from parallel_tiger.utils.io import ensure_dir
@@ -26,16 +26,9 @@ from parallel_tiger.utils.misc import set_seed
 from parallel_tiger.utils.data_loading import (
     load_test_dataset,
 )
-from parallel_tiger.utils.logging_utils import (
-    log_embedding_tables,
-)
 from parallel_tiger.data.collator import TestCollator
 from parallel_tiger.evaluation.metrics import get_topk_results, get_metrics_results
-from parallel_tiger.generation.trie import Trie
-from parallel_tiger.generation.vectorized_constraints import (
-    compute_or_load_transition_constraints_codebook_fast,
-    parse_item
-)
+from parallel_tiger.generation.trie import Trie, prefix_allowed_tokens_fn
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -102,21 +95,13 @@ def test_ddp(cfg: DictConfig):
     tokenizer.padding_side = "left"
     special_tokenizer_tokens_num = len(tokenizer.special_tokens_map)
 
-    # model_config = create_config_from_hydra_cfg(
-    #     cfg,
-    #     is_inference=True,
-    #     is_pretrained_model=True,
-    #     device_map=device_map,
-    #     tokenizer_special_tokens_num=special_tokenizer_tokens_num,
-    # )
     model_config = ModelConfig.load(cfg.output_dir)
     model_config.update_config_to_inference_mode(cfg.infer, device_map)
     logger.info(f"Model config: {model_config}")
-    model_config.mask_token_id = tokenizer.mask_token_id
-    model = T54Rec(model_config)
-
-    # if local_rank == 0:
-    #     log_embedding_tables(cfg, model)
+    model = T5ForConditionalGeneration.from_pretrained(
+        cfg.infer.ckpt_dir,
+        device_map=device_map
+    )
 
     if cfg.infer.debug:
         cfg.infer.test_batch_size = 3
@@ -125,50 +110,32 @@ def test_ddp(cfg: DictConfig):
     test_data = load_test_dataset(cfg)
     all_items = test_data.get_all_items()
 
-    # TODO: PUT THAT IN A FUNCTION (and call it elsewhere?)
-    all_items_tok_split = [parse_item(item) for item in all_items]
-    num_first_tokens = len(set(item[0] for item in all_items_tok_split))
-    logger.debug(f"Number of different 1st tokens: {num_first_tokens}")
-    num_1_2 = len(set((item[0], item[1]) for item in all_items_tok_split))
-    num_1_2_3 = len(set((item[0], item[1], item[2]) for item in all_items_tok_split))
-    num_1_2_3_4 = len(set((item[0], item[1], item[2], item[3]) for item in all_items_tok_split))
-    logger.debug(f"Mean number of 2nd tokens: {num_1_2 / num_first_tokens:.2f} ({num_1_2}/{num_first_tokens})")
-    logger.debug(f"Mean number of 3rd tokens: {num_1_2_3 / num_1_2:.2f} ({num_1_2_3}/{num_1_2})")
-    logger.debug(f"Mean number of 4th tokens: {num_1_2_3_4 / num_1_2_3:.2f} ({num_1_2_3_4}/{num_1_2_3})")
+    # # TODO: PUT THAT IN A FUNCTION (and call it elsewhere?)
+    # all_items_tok_split = [parse_item(item) for item in all_items]
+    # num_first_tokens = len(set(item[0] for item in all_items_tok_split))
+    # logger.debug(f"Number of different 1st tokens: {num_first_tokens}")
+    # num_1_2 = len(set((item[0], item[1]) for item in all_items_tok_split))
+    # num_1_2_3 = len(set((item[0], item[1], item[2]) for item in all_items_tok_split))
+    # num_1_2_3_4 = len(set((item[0], item[1], item[2], item[3]) for item in all_items_tok_split))
+    # logger.debug(f"Mean number of 2nd tokens: {num_1_2 / num_first_tokens:.2f} ({num_1_2}/{num_first_tokens})")
+    # logger.debug(f"Mean number of 3rd tokens: {num_1_2_3 / num_1_2:.2f} ({num_1_2_3}/{num_1_2})")
+    # logger.debug(f"Mean number of 4th tokens: {num_1_2_3_4 / num_1_2_3:.2f} ({num_1_2_3_4}/{num_1_2_3})")
 
     collator = TestCollator(cfg, tokenizer)
     logger.info("len all items: {}".format(len(all_items)))
     logger.info("Number of special tokens in tokenizer: {}".format(special_tokenizer_tokens_num))
 
-    (
-        first_token_constraints_fast,
-        transition_mask_t1,
-        transition_mask_t2,
-        prefix_to_uidx_t3,
-        uidx_to_next_tokens_t3,
-    ) = compute_or_load_transition_constraints_codebook_fast(
-        cfg=cfg,
-        tokenizer=tokenizer,
-        all_items=all_items,
-        first_token_constraints_path=cfg.infer.first_token_constraints_path,
-        transition_constraints_t1_path=cfg.infer.transition_constraints_t1_path,
-        transition_constraints_t2_path=cfg.infer.transition_constraints_t2_path,
-        prefix_to_uidx_t3_path=cfg.infer.prefix_to_uidx_t3_path,
-        uidx_to_next_tokens_t3_path=cfg.infer.uidx_to_next_tokens_t3_path,
-        num_special_tokenizer_tokens=special_tokenizer_tokens_num,
-    )
-    model.set_first_token_constraints_fast(first_token_constraints_fast)
-    model.set_transition_constraints_fast(transition_mask_t1, transition_mask_t2)
-    model.set_transition_constraints_fast_t3(prefix_to_uidx_t3, uidx_to_next_tokens_t3)
-
-    logger.info("Model device: {}".format(model.t5_model.device))
     ddp_sampler = DistributedSampler(
         test_data, num_replicas=world_size, rank=local_rank, drop_last=True
     )
 
-    candidate_trie = Trie([tokenizer.encode(candidate) for candidate in all_items])
-    model.set_candidate_trie(candidate_trie)
+    candidate_trie = Trie(
+        [[0] + tokenizer.encode(candidate) for candidate in all_items]
+    )
+    prefix_allowed_tokens = prefix_allowed_tokens_fn(candidate_trie)
+
     model = DistributedDataParallel(model, device_ids=[local_rank])
+
     prompt_ids = [0]
     logger.info("TASK: {}".format(cfg.infer.test_task))
     test_data = load_test_dataset(cfg)
@@ -178,7 +145,7 @@ def test_ddp(cfg: DictConfig):
         batch_size=cfg.infer.test_batch_size,
         collate_fn=collator,
         sampler=ddp_sampler,
-        num_workers=2,
+        num_workers=cfg.dataloader.num_workers,
         pin_memory=True,
     )
 
@@ -213,20 +180,26 @@ def test_ddp(cfg: DictConfig):
 
                 output = model.module.generate(
                     input_ids=inputs["input_ids"],
-                    input_mask=inputs["attention_mask"],
-                    topK=num_beams,
-                    use_constraints=cfg.infer.use_constraints,
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=4,
+                    prefix_allowed_tokens_fn=prefix_allowed_tokens,
+                    num_beams=num_beams,
+                    num_return_sequences=num_beams,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                    early_stopping=True,
+                    do_sample=cfg.infer.do_sample,
                 )
 
                 output_ids = output["sequences"]  # (bs, num_beams, seq_len)
                 scores = output["sequences_scores"]  # (bs, num_beams)
 
-                # Flatten the first two dimensions
-                # to ensure compatibility with MQL4GRec's original implementation
-                output_ids = output_ids.view(
-                    -1, output_ids.shape[-1]
-                )  # (bs * num_beams, seq_len)
-                scores = scores.view(-1)  # (bs * num_beams,)
+                # # Flatten the first two dimensions
+                # # to ensure compatibility with MQL4GRec's original implementation
+                # output_ids = output_ids.view(
+                #     -1, output_ids.shape[-1]
+                # )  # (bs * num_beams, seq_len)
+                # scores = scores.view(-1)  # (bs * num_beams,)
 
                 output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
@@ -339,23 +312,29 @@ def test_ddp(cfg: DictConfig):
             # --- ClearML: log aggregated metrics ---
             for m in metrics:
                 task.get_logger().report_scalar("Mean Results", m, mean_results[m], iteration=0)
+                task.get_logger().report_single_value(f"Mean_{m}", mean_results[m])
                 task.get_logger().report_scalar("Min Results", m, min_results[m], iteration=0)
                 task.get_logger().report_scalar("Max Results", m, max_results[m], iteration=0)
             # task.upload_artifact("evaluation_results", save_data) # comment line because it creates a deadlock
             # TODO: solve issue. See https://github.com/clearml/clearml-agent/issues/73 
-            task.close()
-            logger.info("ClearML task closed.")
+
+    return task
 
 @hydra.main(
     version_base=None, 
-    config_path="../../conf/parallel_tiger", 
+    config_path="../../conf/tiger", 
     config_name="infer_config.yaml")
 def main(cfg: DictConfig):
     logger.info("Current configuration:\n")
     logger.info(OmegaConf.to_yaml(cfg))
     t0 = t.time()
-    test_ddp(cfg)
-    logger.info("Time taken for inference: {}".format(t.time() - t0))
+    task = test_ddp(cfg)
+    inference_n_eval_time = t.time() - t0
+    logger.info("Time taken for inference: {}".format(inference_n_eval_time))
+    if task:
+        task.get_logger().report_single_value("inference_n_eval_time", inference_n_eval_time)
+        task.close()
+        logger.info("ClearML task closed.")
 
 if __name__ == "__main__":
     main()

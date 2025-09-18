@@ -92,6 +92,7 @@ class T5ModelConfig:
     dropout_rate: float = 0.1
     layer_norm_epsilon: float = 1e-6
     tie_word_embeddings: bool = False
+    decoder_start_token_id: int = 0
 
     def __post_init__(self):
         self._validate_config()

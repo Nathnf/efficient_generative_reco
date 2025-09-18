@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # helper functions 
 
 def safe_log_softmax(logits, dim=-1):
+    # prevent NaNs when all logits are -inf
     row_invalid = (logits == float('-inf')).all(dim=dim)
     log_probs = F.log_softmax(logits, dim=dim)
     log_probs[row_invalid] = -float("inf")
@@ -105,7 +106,7 @@ class DecoderOnlyTransformer(nn.Module):
 
 # main class
 
-class RQTransformer(nn.Module):
+class BaseRQTransformer(nn.Module):
     def __init__(
         self,
         *,
@@ -114,15 +115,13 @@ class RQTransformer(nn.Module):
         max_spatial_seq_len,
         depth_seq_len,
         spatial_layers,
-        depth_layers,
         dim_head = 64,
         heads = 8,
         attn_dropout = 0.,
         ff_mult = 4,
         ff_dropout = 0.,
         pad_id = 0,
-        num_special_tokens = 4,
-        attention_type = None
+        num_special_tokens = 4
     ):
         super().__init__()
         self.dim = dim
@@ -150,24 +149,14 @@ class RQTransformer(nn.Module):
             ff_mult = ff_mult
         )
 
-        self.depth_transformer = DecoderOnlyTransformer(
-            dim = dim,
-            layers = depth_layers,
-            attn_cls=CausalSelfAttention,
-            ff_cls=FeedForward,
-            dim_head = dim_head,
-            heads = heads,
-            attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout,
-            ff_mult = ff_mult
-        )
-
-        # self.to_logits = nn.Linear(dim, num_tokens)
         self.to_logits = nn.ModuleList(
             nn.Linear(dim, num_tokens, bias=False) for _ in range(depth_seq_len)
         ) # NOTE: THIS DOES A SEPARATE PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
+
         self.pad_id = pad_id
         self.candidate_trie: Optional[Trie] = None
+
+        self._check_insert_start_token()
 
     def set_candidate_trie(self, candidate_trie: Trie):
         self.candidate_trie = candidate_trie
@@ -211,6 +200,42 @@ class RQTransformer(nn.Module):
         )
         attention_mask_extended = torch.cat([attention_mask, torch.ones((b,1), dtype=torch.bool, device=device)], dim=1)
         return spatial_tokens_extended, attention_mask_extended
+    
+    def _insert_start_token_unvectorized(self, spatial_tokens, attention_mask, start_token):
+        new_spatial_tokens = []
+        b, s, _ = spatial_tokens.shape
+        is_padding = ~attention_mask
+        attention_mask_extended = torch.zeros((b, s + 1), dtype=torch.bool, device=spatial_tokens.device)
+        for i in range(b):
+            # get last padding index
+            last_padding_index = is_padding[i].sum().item()
+            new_spatial_tokens.append(
+                torch.cat([
+                    spatial_tokens[i, :last_padding_index],
+                    start_token.unsqueeze(0),
+                    spatial_tokens[i, last_padding_index:],
+                ], dim=0)
+            )
+            attention_mask_extended[i, :last_padding_index] = attention_mask[i, :last_padding_index]
+            attention_mask_extended[i, last_padding_index] = True  # start token position
+            attention_mask_extended[i, last_padding_index + 1:] = attention_mask[i, last_padding_index:]
+        new_spatial_tokens = torch.stack(new_spatial_tokens, dim=0)
+        
+        return new_spatial_tokens, attention_mask_extended
+
+    def _check_insert_start_token(self):
+        b, s, f = 256, 20, 128
+        spatial_tokens = torch.randn(b, s, f)
+        start_token = torch.zeros(f, device=spatial_tokens.device)
+        import random
+        attention_mask = torch.zeros((b, s), dtype=torch.bool, device=spatial_tokens.device)
+        for i in range(b):
+            num_paddings = random.randint(0, s-1)   # s-1 because we want at least one non-padding token
+            attention_mask[i, -num_paddings:] = 1
+        spatial_tokens_extended, attention_mask_extended = self._insert_start_token(spatial_tokens, attention_mask, start_token)
+        spatial_tokens_extended_unvector, attention_mask_extended_unvector = self._insert_start_token_unvectorized(spatial_tokens, attention_mask, start_token)
+        assert torch.equal(spatial_tokens_extended, spatial_tokens_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for spatial_tokens"
+        assert torch.equal(attention_mask_extended, attention_mask_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for attention_mask"
 
     def _spatial_forward(self, ids, attention_mask):
         # require flattened input for compability with MQL4GRec data collator
@@ -244,6 +269,65 @@ class RQTransformer(nn.Module):
 
         return tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len
 
+    def _adapt_labels_to_multi_head(self, labels):
+        labels = labels.view(-1)  # (b * s * d,) if training or (b * d,) if validation/inference
+        outer_dim = labels.shape[0] // self.depth_seq_len  # b*s if training, b if validation/inference
+        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
+        labels = torch.where(
+            labels == self.pad_id,
+            -100,
+            labels - offset.repeat(outer_dim).to(labels.device) - self.num_special_tokens,
+        )
+        return labels
+
+    
+
+class RQTransformer(BaseRQTransformer):
+    def __init__(
+        self,
+        *,
+        num_tokens,
+        dim,
+        max_spatial_seq_len,
+        depth_seq_len,
+        spatial_layers,
+        depth_layers,
+        dim_head = 64,
+        heads = 8,
+        attn_dropout = 0.,
+        ff_mult = 4,
+        ff_dropout = 0.,
+        pad_id = 0,
+        attention_type = None,
+        num_special_tokens = 4
+    ):
+        super().__init__(
+            num_tokens=num_tokens,
+            dim=dim,
+            max_spatial_seq_len=max_spatial_seq_len,
+            depth_seq_len=depth_seq_len,
+            spatial_layers=spatial_layers,
+            dim_head=dim_head,
+            heads=heads,
+            attn_dropout=attn_dropout,
+            ff_mult=ff_mult,
+            ff_dropout=ff_dropout,
+            pad_id=pad_id,
+            num_special_tokens=num_special_tokens
+        )
+
+        self.depth_transformer = DecoderOnlyTransformer(
+            dim = dim,
+            layers = depth_layers,
+            attn_cls=CausalSelfAttention,
+            ff_cls=FeedForward,
+            dim_head = dim_head,
+            heads = heads,
+            attn_dropout = attn_dropout,
+            ff_dropout = ff_dropout,
+            ff_mult = ff_mult
+        )
+
     def forward(self, ids, attention_mask, *args):
         tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len = self._spatial_forward(ids, attention_mask) # (b, s+1, f), int, int
 
@@ -264,16 +348,7 @@ class RQTransformer(nn.Module):
         logits = logits[:, :-1, :, :] # remove logits corresponding to last item (no ground truth)
         preds = rearrange(logits, 'b s d f -> (b s d) f')
 
-        labels = ids.flatten() # (b * s * d,)
-
-        # adapt labels to multi-head projection layer
-        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
-        labels = torch.where(
-            labels==self.pad_id,
-            -100,
-            labels - offset.repeat(b*spatial_seq_len).to(labels.device) - self.num_special_tokens
-        )
-
+        labels = self._adapt_labels_to_multi_head(ids)
         loss = F.cross_entropy(preds, labels, ignore_index = -100)
         return loss, None
 
@@ -383,11 +458,8 @@ class RQTransformer(nn.Module):
     def forward_validation(self, ids, attention_mask, labels, *args):
         logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask) # (b, d, num_tokens)
         preds = rearrange(logits, 'b d f -> (b d) f') # (b * d, num_tokens)
-        labels = labels.view(-1) # (b * d,)
-
-        # adapt labels to multi-head projection layer
-        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
-        labels = labels - offset.repeat(b).to(labels.device) - self.num_special_tokens
+        
+        labels = self._adapt_labels_to_multi_head(labels)
 
         # TODO: ADD CUSTOM LOSS COMPUTER (cf. T54Rec)
         loss = F.cross_entropy(preds, labels, ignore_index = -100) # NB: there shouldn't be any padding in validation
@@ -431,7 +503,7 @@ class RQTransformer(nn.Module):
     #     return loss
 
 
-class RQQTransformer(nn.Module):
+class RQQTransformer(BaseRQTransformer):
     def __init__(
         self,
         *,
@@ -451,33 +523,22 @@ class RQQTransformer(nn.Module):
         num_special_tokens = 4
     ):
         assert attention_type in {'full', 'sparse'}
-        super().__init__()
-        self.dim = dim
-        self.max_spatial_seq_len = max_spatial_seq_len
-        self.depth_seq_len = depth_seq_len
-        self.num_tokens = num_tokens
-        self.num_special_tokens = num_special_tokens
-
-        # self.token_emb = nn.Embedding(num_tokens, dim)
-        self.token_emb = nn.Embedding(num_tokens * depth_seq_len + num_special_tokens, dim)
-        self.spatial_start_token = nn.Parameter(torch.randn(dim))
-
-        self.spatial_pos_emb = nn.Embedding(max_spatial_seq_len + 1, dim) # account for a boundary case
-        self.depth_pos_emb = nn.Embedding(depth_seq_len, dim)
+        super().__init__(
+            num_tokens=num_tokens,
+            dim=dim,
+            max_spatial_seq_len=max_spatial_seq_len,
+            depth_seq_len=depth_seq_len,
+            spatial_layers=spatial_layers,
+            dim_head=dim_head,
+            heads=heads,
+            attn_dropout=attn_dropout,
+            ff_mult=ff_mult,
+            ff_dropout=ff_dropout,
+            pad_id=pad_id,
+            num_special_tokens=num_special_tokens
+        )
 
         self.depth_queries = nn.Parameter(torch.randn(depth_seq_len, dim)) # learnable depth queries # depth_seq_len = number of queries
-
-        self.spatial_transformer = DecoderOnlyTransformer(
-            dim = dim,
-            layers = spatial_layers,
-            attn_cls=CausalSelfAttention,
-            ff_cls=FeedForward,
-            dim_head = dim_head,
-            heads = heads,
-            attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout,
-            ff_mult = ff_mult
-        )
 
         self.depth_transformer = DecoderOnlyTransformer(
             dim = dim,
@@ -491,13 +552,8 @@ class RQQTransformer(nn.Module):
             ff_mult = ff_mult,
         )
 
-        # self.to_logits = nn.Linear(dim, num_tokens) # NOTE: THIS DOES A SHARED PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
-        self.to_logits = nn.ModuleList(
-            nn.Linear(dim, num_tokens, bias=False) for _ in range(depth_seq_len)
-        ) # NOTE: THIS DOES A SEPARATE PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
-        self.pad_id = pad_id
         self._setup_generation_components()
-        self._check_insert_start_token()
+
 
     def set_first_token_constraint_mask(self, first_token_constraint_mask):
         self.first_token_constraint_mask = first_token_constraint_mask.to(dtype=torch.bool)
@@ -512,9 +568,6 @@ class RQQTransformer(nn.Module):
         self.prefix_to_uidx_t3 = prefix_to_uidx_t3.to(dtype=torch.long)
         self.uidx_to_next_tokens_t3 = uidx_to_next_tokens_t3.to(dtype=torch.bool)
 
-    def set_candidate_trie(self, candidate_trie):
-        self.candidate_trie = candidate_trie
-
     def _setup_generation_components(self):
         self.generator = ParallelBeamSearchGenerator(
             model=self,
@@ -522,70 +575,6 @@ class RQQTransformer(nn.Module):
             stochastic=False,   # LATER: NOT HARDCODE IT
             temperatures=None,  # IDEM
         )
-
-    def _insert_start_token(self, spatial_tokens, attention_mask, start_token):
-        # spatial_tokens: (b, s, f)
-        # attention_mask: (b, s) - True for non-padding tokens
-        # start_token: (f,)
-        b, s, f = spatial_tokens.shape
-        device = spatial_tokens.device
-        is_padding = ~attention_mask
-        last_padding_index = is_padding.sum(dim=-1)
-        spatial_tokens_extended = torch.zeros((b, s+1, f), dtype=spatial_tokens.dtype, device=device)
-        batch_dim = torch.arange(b, dtype=torch.long, device=device)
-        spatial_tokens_extended[batch_dim, last_padding_index] = start_token.expand(b, f)
-        is_padding_extended = torch.cat([is_padding, torch.zeros((b,1), dtype=torch.bool, device=device)], dim=1)
-        spatial_tokens_r_extended = torch.cat([spatial_tokens, torch.zeros((b,1,f), device=device)], dim=1)
-        spatial_tokens_extended = torch.where(
-            is_padding_extended.unsqueeze(-1),
-            spatial_tokens_r_extended,
-            spatial_tokens_extended
-        )
-        is_not_padding_extended = torch.cat([torch.zeros((b,1), dtype=torch.bool, device=device), attention_mask], dim=1)
-        spatial_tokens_l_extended = torch.cat([torch.zeros((b,1,f), device=device), spatial_tokens], dim=1)
-        spatial_tokens_extended = torch.where(
-            is_not_padding_extended.unsqueeze(-1),
-            spatial_tokens_l_extended,
-            spatial_tokens_extended
-        )
-        attention_mask_extended = torch.cat([attention_mask, torch.ones((b,1), dtype=torch.bool, device=device)], dim=1)
-        return spatial_tokens_extended, attention_mask_extended
-    
-    def _insert_start_token_unvectorized(self, spatial_tokens, attention_mask, start_token):
-        new_spatial_tokens = []
-        b, s, _ = spatial_tokens.shape
-        is_padding = ~attention_mask
-        attention_mask_extended = torch.zeros((b, s + 1), dtype=torch.bool, device=spatial_tokens.device)
-        for i in range(b):
-            # get last padding index
-            last_padding_index = is_padding[i].sum().item()
-            new_spatial_tokens.append(
-                torch.cat([
-                    spatial_tokens[i, :last_padding_index],
-                    start_token.unsqueeze(0),
-                    spatial_tokens[i, last_padding_index:],
-                ], dim=0)
-            )
-            attention_mask_extended[i, :last_padding_index] = attention_mask[i, :last_padding_index]
-            attention_mask_extended[i, last_padding_index] = True  # start token position
-            attention_mask_extended[i, last_padding_index + 1:] = attention_mask[i, last_padding_index:]
-        new_spatial_tokens = torch.stack(new_spatial_tokens, dim=0)
-        
-        return new_spatial_tokens, attention_mask_extended
-
-    def _check_insert_start_token(self):
-        b, s, f = 256, 20, 128
-        spatial_tokens = torch.randn(b, s, f)
-        start_token = torch.zeros(f, device=spatial_tokens.device)
-        import random
-        attention_mask = torch.zeros((b, s), dtype=torch.bool, device=spatial_tokens.device)
-        for i in range(b):
-            num_paddings = random.randint(0, s-1)   # s-1 because we want at least one non-padding token
-            attention_mask[i, -num_paddings:] = 1
-        spatial_tokens_extended, attention_mask_extended = self._insert_start_token(spatial_tokens, attention_mask, start_token)
-        spatial_tokens_extended_unvector, attention_mask_extended_unvector = self._insert_start_token_unvectorized(spatial_tokens, attention_mask, start_token)
-        assert torch.equal(spatial_tokens_extended, spatial_tokens_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for spatial_tokens"
-        assert torch.equal(attention_mask_extended, attention_mask_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for attention_mask"
 
     def _compute_loss_with_mask(
         self,
@@ -642,38 +631,6 @@ class RQQTransformer(nn.Module):
 
         return loss.mean(), loss_per_codebook
 
-    def _spatial_forward(self, ids, attention_mask):
-        # require flattened input for compability with MQL4GRec data collator
-        assert ids.ndim == 3 # ids: (b, s, d)
-        assert attention_mask.ndim == 3 # attention_mask: (b, s, d)
-
-        b, spatial_seq_len, depth, device = *ids.shape, ids.device
-        assert spatial_seq_len <= (self.max_spatial_seq_len + 1), f'spatial dimension ({spatial_seq_len}) is greater than the max_spatial_seq_len set ({self.max_spatial_seq_len + 1})'
-        assert depth == self.depth_seq_len, 'depth dimension must be equal to depth_seq_len'
-
-        # get token embeddings
-        tokens = self.token_emb(ids) # (b, spatial_seq_len, d, f)
-
-        spatial_pos = self.spatial_pos_emb(torch.arange(spatial_seq_len, device = device))
-        depth_pos = self.depth_pos_emb(torch.arange(depth, device = device))
-
-        tokens_with_depth_pos = tokens + depth_pos
-
-        # spatial tokens is tokens with depth pos reduced along depth dimension + spatial positions
-        spatial_tokens = reduce(tokens_with_depth_pos, 'b s d f -> b s f', 'sum') + spatial_pos 
-        # s: spatial dim (seq len)
-        # d: depth dim (depth_seq_len)
-        # f: feature dim (embedding size)
-
-        spatial_attention_mask = attention_mask.any(dim = -1)
-
-        # Insert start token at the position of the last padding token for each batch element - also adapt attention mask
-        spatial_tokens, spatial_attention_mask = self._insert_start_token(spatial_tokens, spatial_attention_mask, self.spatial_start_token) # (b, s+1, f), (b, s+1)
-
-        spatial_tokens = self.spatial_transformer(spatial_tokens, spatial_attention_mask) # (b, s+1, f)
-
-        return tokens_with_depth_pos, spatial_tokens, b, spatial_seq_len
-
     def forward(self, ids, attention_mask, use_query_vectors_mask=None):
         # if use_query_vectors_mask is not None:
         # --> boolean mask of shape (b, s, d), with:
@@ -715,15 +672,8 @@ class RQQTransformer(nn.Module):
 
         # preds = logits.view(-1, logits.size(-1)) # (b * seq_len, num_tokens) # RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
         preds = logits.reshape(-1, logits.size(-1)) # (b * seq_len, num_tokens)
-        labels = ids.flatten() # (b * seq_len,)
-
-        # adapt labels to multi-head projection layer
-        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
-        labels = torch.where(
-            labels==self.pad_id,
-            -100,
-            labels - offset.repeat(b*spatial_seq_len).to(labels.device) - self.num_special_tokens
-        )
+        
+        labels = self._adapt_labels_to_multi_head(ids)
 
         loss, loss_per_codebook = self._compute_loss_with_mask(
             preds,
@@ -769,11 +719,8 @@ class RQQTransformer(nn.Module):
 
         logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask, use_query_vectors_mask) # (b, d, num_tokens)
         preds = logits.view(-1, logits.size(-1)) # (b * d, num_tokens)
-        labels = labels.view(-1) # (b * d,)
-
-        # adapt labels to multi-head projection layer
-        offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
-        labels = labels - offset.repeat(b).to(labels.device) - self.num_special_tokens
+        
+        labels = self._adapt_labels_to_multi_head(labels)
 
         loss, loss_per_codebook = self._compute_loss_with_mask(
             preds,

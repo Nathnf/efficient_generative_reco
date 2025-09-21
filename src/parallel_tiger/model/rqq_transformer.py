@@ -53,20 +53,6 @@ class RQQTransformer(BaseRQTransformer):
 
         self._setup_generation_components()
 
-
-    def set_first_token_constraint_mask(self, first_token_constraint_mask):
-        self.first_token_constraint_mask = first_token_constraint_mask.to(dtype=torch.bool)
-
-    def set_transition_constraint_masks(self, transition_mask_t1, transition_mask_t2):
-        self.transition_constraint_masks = {
-            1: transition_mask_t1.to(dtype=torch.bool),
-            2: transition_mask_t2.to(dtype=torch.bool),
-        }
-
-    def set_transition_constraints_fast_t3(self, prefix_to_uidx_t3, uidx_to_next_tokens_t3):
-        self.prefix_to_uidx_t3 = prefix_to_uidx_t3.to(dtype=torch.long)
-        self.uidx_to_next_tokens_t3 = uidx_to_next_tokens_t3.to(dtype=torch.bool)
-
     def _setup_generation_components(self):
         self.generator = ParallelBeamSearchGenerator(
             model=self,
@@ -74,61 +60,6 @@ class RQQTransformer(BaseRQTransformer):
             stochastic=False,   # LATER: NOT HARDCODE IT
             temperatures=None,  # IDEM
         )
-
-    def _compute_loss_with_mask(
-        self,
-        preds,
-        labels,
-        use_query_vectors_mask,
-        depth_seq_len,
-        # spatial_seq_len=None,
-    ):
-        """
-        Compute the cross-entropy loss with optional masking of certain query vectors.
-        Adapted to both training case (b, s, d) and validation case (b, d).
-
-        preds: (N, num_tokens) where N = b*d or b*s*d
-        labels: (N,)
-        use_query_vectors_mask: None, or (b, d) / (b, s, d)
-        depth_seq_len: int
-        spatial_seq_len: int or None (if present, use (b, s, d) mode)
-        """
-
-        if use_query_vectors_mask is not None:
-            use_query_vectors_mask_flat = use_query_vectors_mask.flatten()
-            labels = torch.where(
-                use_query_vectors_mask_flat,
-                labels,
-                -100
-            )
-
-            # compute loss weights normalized per sample
-            num_masked_per_sample = use_query_vectors_mask.sum(dim=-1)  # (b,) or (b, s)
-            loss_weights = torch.where(
-                use_query_vectors_mask,
-                1.0 / num_masked_per_sample.unsqueeze(-1).float(),  # safe by construction
-                0.0
-            ).flatten()
-        else:
-            loss_weights = torch.ones_like(labels, dtype=torch.float32)
-
-        loss = F.cross_entropy(
-            preds, labels, ignore_index=-100, reduction="none"
-        ) * loss_weights
-
-        # if spatial_seq_len is None:
-        #     # case (b, d)
-        #     b = labels.shape[0] // depth_seq_len
-        #     loss_per_codebook = loss.view(b, depth_seq_len).sum(dim=0)  # (d,)
-        # else:
-        #     # case (b, s, d)
-        #     b = labels.shape[0] // (spatial_seq_len * depth_seq_len)
-        #     loss_per_codebook = loss.view(b * spatial_seq_len, depth_seq_len).sum(dim=0)  # (d,)
-        loss_per_codebook = loss.view(-1, depth_seq_len).sum(dim=0)  # (d,)
-        norm_factor = preds.size(0) if use_query_vectors_mask is None else use_query_vectors_mask.sum().item()
-        loss_per_codebook = loss_per_codebook / norm_factor
-
-        return loss.mean(), loss_per_codebook
 
     def forward(self, ids, attention_mask, use_query_vectors_mask=None):
         # if use_query_vectors_mask is not None:
@@ -216,7 +147,7 @@ class RQQTransformer(BaseRQTransformer):
         if use_query_vectors_mask is not None:
             assert use_query_vectors_mask.shape == labels.shape, "use_query_vectors_mask must have the same shape as labels = (b, d)"
 
-        logits, b = self._get_logits_from_last_spatial_token(ids, attention_mask, use_query_vectors_mask) # (b, d, num_tokens)
+        logits, _ = self._get_logits_from_last_spatial_token(ids, attention_mask, use_query_vectors_mask) # (b, d, num_tokens)
         preds = logits.view(-1, logits.size(-1)) # (b * d, num_tokens)
         
         labels = self._adapt_labels_to_multi_head(labels)

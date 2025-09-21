@@ -225,7 +225,6 @@ class TestCollator(BaseCollator):
         # logger.debug("self.prefix_token:", self.prefix_token)
         # logger.debug("inputs:", inputs)
         # logger.debug("targets:", targets)
-
         bs, seq_len = inputs["input_ids"].shape
         assert seq_len % self.n_query == 0, f"Sequence length {seq_len} not divisible by n_query {self.n_query}"
         n_items = seq_len // self.n_query

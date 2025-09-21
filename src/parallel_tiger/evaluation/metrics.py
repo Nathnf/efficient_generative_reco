@@ -50,19 +50,18 @@ def get_topk_results(predictions, scores, targets, k, all_items=None):
     # # logger.debug(f"Total scores: {len(scores)}")
     # # logger.debug(f"all_items is not None: {all_items is not None}")
     # print the first 10 elements of predictions, targets, scores
-    # # logger.debug(f"First 10 predictions: {predictions[:10]}")
-    # # logger.debug(f"First 10 targets: {targets[:10]}")
-    # # logger.debug(f"First 10 scores: {scores[:10]}")
-    invalid_count = 0
+    # logger.debug(f"First 10 predictions: {predictions[:10]}")
+    # logger.debug(f"First 10 targets: {targets[:10]}")
+    # logger.debug(f"First 10 scores: {scores[:10]}")
+    # invalid_count = 0
     if all_items is not None:
         for i, seq in enumerate(predictions):
             if seq not in all_items:
+                # if invalid_count < 10:
+                #     print(f"Warning: {seq} not in all_items, setting score to -1000 (initially {scores[i]})")
+                # invalid_count += 1
                 incorrect_pred_no += 1
                 scores[i] = -1000
-                # # if invalid_count < 10:
-                    # # print(f"Warning: {seq} not in all_items, setting score to -1000 (initially {scores[i]})")
-                # # invalid_count += 1
-
             else:
                 correct_pred_no += 1
 

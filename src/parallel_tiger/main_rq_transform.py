@@ -5,7 +5,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import sys
 import time
 from typing import Tuple, Optional
-import numpy as np
 import torch
 from torch.distributed import is_initialized, get_rank
 from torch.utils.data import DataLoader
@@ -189,6 +188,7 @@ def train(cfg: DictConfig):
     tokenizer.padding_side = "left"
 
     model_cls = RQQTransformer if cfg.get("model_type", "rqqt").lower() == "rqqt" else RQTransformer
+    logger.info(f"Using model class: {model_cls.__name__}")
     model = model_cls(
         num_tokens=cfg.code_num,
         dim=cfg.model.dim,
@@ -245,7 +245,7 @@ def train(cfg: DictConfig):
         logger.info("{}".format(valid_data[min(100, len(valid_data) - 1)]))
         logger.info("{}".format(model))
         log_trainable_parameters(model)
-        logger.debug("Model state dict at initialization: \n{}".format(model.state_dict()))
+        # logger.debug("Model state dict at initialization: \n{}".format(model.state_dict()))
 
     pl_module = LitRQQTransformer(
         model=model,
@@ -311,8 +311,8 @@ def train(cfg: DictConfig):
     pl_module.load_state_dict(torch.load(checkpoint.best_model_path)["state_dict"])
     # TODO: save model as well (or already done by checkpoint?)
 
-    if local_rank == 0:
-        logger.debug("Model state dict after training: \n{}".format(model.state_dict()))
+    # if local_rank == 0:
+    #     logger.debug("Model state dict after training: \n{}".format(model.state_dict()))
 
     if task is not None:
         task.get_logger().report_single_value('training_time', training_time)
@@ -340,7 +340,7 @@ def predict(
         batch_size=cfg.infer.batch_size,
         num_workers=cfg.dataloader.num_workers,
         # pin_memory=True,
-    )    
+    )
 
     (
         first_token_constraints_fast,

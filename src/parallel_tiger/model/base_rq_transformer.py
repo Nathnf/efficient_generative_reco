@@ -133,8 +133,7 @@ class BaseRQTransformer(nn.Module):
         self.num_tokens = num_tokens
         self.num_special_tokens = num_special_tokens
 
-        # self.token_emb = nn.Embedding(num_tokens, dim)
-        self.token_emb = nn.Embedding(num_tokens * depth_seq_len + num_special_tokens, dim)
+        self.token_emb = nn.Embedding(num_tokens * depth_seq_len + num_special_tokens, dim) # num_special_tokens to account for special tokens
         self.spatial_start_token = nn.Parameter(torch.randn(dim))
 
         self.spatial_pos_emb = nn.Embedding(max_spatial_seq_len + 1, dim) # account for a boundary case
@@ -154,10 +153,14 @@ class BaseRQTransformer(nn.Module):
 
         self.to_logits = nn.ModuleList(
             nn.Linear(dim, num_tokens, bias=False) for _ in range(depth_seq_len)
-        ) # NOTE: THIS DOES A SEPARATE PROJECTION TO LOGITS FOR ALL DEPTH TOKENS
+        )
 
         self.pad_id = pad_id
         self.candidate_trie: Optional[Trie] = None
+        self.first_token_constraint_mask = None
+        self.transition_constraint_masks = {1: None, 2: None} # for step 1 and 2
+        self.prefix_to_uidx_t3 = None
+        self.uidx_to_next_tokens_t3 = None
 
         self._check_insert_start_token()
 
@@ -165,16 +168,17 @@ class BaseRQTransformer(nn.Module):
         self.candidate_trie = candidate_trie
 
     def set_first_token_constraint_mask(self, first_token_constraint_mask):
-        # placeholder
-        pass
+        self.first_token_constraint_mask = first_token_constraint_mask.to(dtype=torch.bool)
 
     def set_transition_constraint_masks(self, transition_mask_t1, transition_mask_t2):
-        # placeholder
-        pass
+        self.transition_constraint_masks = {
+            1: transition_mask_t1.to(dtype=torch.bool),
+            2: transition_mask_t2.to(dtype=torch.bool),
+        }
 
     def set_transition_constraints_fast_t3(self, prefix_to_uidx_t3, uidx_to_next_tokens_t3):
-        # placeholder
-        pass
+        self.prefix_to_uidx_t3 = prefix_to_uidx_t3.to(dtype=torch.long)
+        self.uidx_to_next_tokens_t3 = uidx_to_next_tokens_t3.to(dtype=torch.bool)
 
     def _insert_start_token(self, spatial_tokens, attention_mask, start_token):
         # spatial_tokens: (b, s, f)
@@ -282,6 +286,60 @@ class BaseRQTransformer(nn.Module):
             labels - offset.repeat(outer_dim).to(labels.device) - self.num_special_tokens,
         )
         return labels
+    
+    def _compute_loss_with_mask(
+        self,
+        preds,
+        labels,
+        use_query_vectors_mask,
+        depth_seq_len,
+    ):
+        """
+        Compute the cross-entropy loss with optional masking of certain query vectors.
+        Adapted to both training case (b, s, d) and validation case (b, d).
+        NOTE: 
+        - The masking is only used for the `RQQTransformer` model, when training with partial query vectors.
+        - RQTransformer always uses all query vectors, so `use_query_vectors_mask` is always None.
+
+        preds: (N, num_tokens) where N = b*d or b*s*d
+        labels: (N,)
+        use_query_vectors_mask: None, or (b, d) / (b, s, d)
+        depth_seq_len: int
+        """
+
+        if use_query_vectors_mask is not None:
+            use_query_vectors_mask_flat = use_query_vectors_mask.flatten()
+            labels = torch.where(
+                use_query_vectors_mask_flat,
+                labels,
+                -100
+            )
+
+            # compute loss weights normalized per sample
+            num_masked_per_sample = use_query_vectors_mask.sum(dim=-1)  # (b,) or (b, s)
+            loss_weights = torch.where(
+                use_query_vectors_mask,
+                1.0 / num_masked_per_sample.unsqueeze(-1).float(),  # safe by construction
+                0.0
+            ).flatten()
+        else:
+            loss_weights = torch.ones_like(labels, dtype=torch.float32)
+
+        loss = F.cross_entropy(
+            preds, labels, ignore_index=-100, reduction="none"
+        ) * loss_weights
+
+        loss_per_codebook = loss.view(-1, depth_seq_len).sum(dim=0)  # (d,)
+        loss_per_codebook = loss_per_codebook / preds.size(0)
+
+        return loss.mean(), loss_per_codebook
+
+    def _local_to_global_id(self, local_id, depth_idx):
+        return local_id + depth_idx * self.num_tokens + self.num_special_tokens
+
+    def _global_to_local_id(self, global_id, depth_idx):
+        # return (global_id - self.num_special_tokens) % self.num_tokens
+        return global_id - (self.num_special_tokens + depth_idx * self.num_tokens)
 
 
 class LitRQQTransformer(pl.LightningModule):

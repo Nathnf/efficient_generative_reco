@@ -30,7 +30,7 @@ train:
   lr_scheduler: "cosine"
   warmup_steps: 1000
   early_stopping_patience: 10
-  max_epochs: 100
+  max_epochs: 300
   gradient_accumulation_steps: 2
   fp16: false
   bf16: false

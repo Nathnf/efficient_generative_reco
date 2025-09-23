@@ -33,6 +33,7 @@ class SeqRecDataset(BaseDataset):
         self.prompt_id = prompt_id
         self.train_and_val_sample_num = cfg.train.train_and_val_sample_num
         self.overfit_val = cfg.train.overfit_val
+        self.overfit_test = cfg.infer.overfit_test
         self.sample_num = sample_num
         self.train_data_mode = cfg.dataset.train_data_mode
         self.task = task
@@ -102,7 +103,7 @@ class SeqRecDataset(BaseDataset):
     
     def _maybe_sample(self, inter_data):
         if self.train_and_val_sample_num > 0 and len(inter_data) > self.train_and_val_sample_num:
-            if self.overfit_val:
+            if self.overfit_val or self.overfit_test:
                 # same training and validation sequences
                 sample_idx = range(self.train_and_val_sample_num)
             else:
@@ -167,8 +168,9 @@ class SeqRecDataset(BaseDataset):
             items = self.remapped_inters[uid]
             one_data = dict()
             # one_data["user"] = uid
-            one_data["item"] = items[-1]
-            history = items[:-1]
+            index = -1 if not self.overfit_test else -3
+            one_data["item"] = items[index]
+            history = items[:index]
             if self.max_his_len > 0:
                 history = history[-self.max_his_len :]
 
@@ -181,7 +183,7 @@ class SeqRecDataset(BaseDataset):
             # print(sample_idx[:10])##################
             inter_data = np.array(inter_data)[sample_idx].tolist()
 
-        return inter_data
+        return self._maybe_sample(inter_data)
 
     def __len__(self):
         return len(self.inter_data)

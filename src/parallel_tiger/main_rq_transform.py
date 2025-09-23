@@ -19,6 +19,7 @@ from pytorch_lightning.callbacks import (
 )
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.utilities.rank_zero import rank_zero_only # type: ignore[ReportPrivateImportUsage]
+from pytorch_lightning.tuner import Tuner
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -63,16 +64,7 @@ logger = logging.getLogger(__name__)
 def initialize_logging_task(cfg: DictConfig) -> Optional[Tuple[Task, TensorBoardLogger]]:
     if cfg.enable_clearml and hasattr(cfg, 'project_name') and hasattr(cfg, 'exp_name'):
 
-        # # get job number from hydra config
-        # hydra_cfg = hydra.core.hydra_config.HydraConfig.get()
-        # print("hydra_cfg.job: ", hydra_cfg.job)
-        # job_num = getattr(hydra_cfg.job, 'num', None)
-        # if job_num is None:
-        #     import random
-        #     job_num = random.randint(1000, 9999)
-        #     logger.warning("Hydra job number not found. Using random job number %s.", job_num)
-
-        for version in range(100):
+        for version in range(1000):
             task_name = f"{cfg.exp_name}_v{version}"
             existing_tasks = Task.get_tasks(project_name=cfg.project_name, task_name=f"^{task_name}$") # exact match
             if len(existing_tasks) == 0:
@@ -80,9 +72,8 @@ def initialize_logging_task(cfg: DictConfig) -> Optional[Tuple[Task, TensorBoard
                 logger.info(f"Using version {job_num} for task {cfg.exp_name}")
                 break
         else:
-            import random
-            job_num = random.randint(1000, 9999)
-            logger.info(f"All versions 0-99 taken. Using random job number {job_num}.")
+            job_num = int(time.time()) % 10000 # ensures variability even when everything is seeded the same
+            logger.info(f"All versions 0-999 taken. Using random job number {job_num}.")
 
         task = Task.init(
             project_name=cfg.project_name,
@@ -142,27 +133,53 @@ class ClearMLCodebookLogger(Callback):
         if task is None:
             return
 
-        # Collect loss_per_codebook from the module
-        if hasattr(pl_module, "loss_per_codebook"):
-            loss_per_codebook = pl_module.loss_per_codebook
+        if self.mode == "train":
+            loss_per_codebook = getattr(pl_module, "train_codebook_epoch_loss", None)
         else:
-            # Fallback: try from trainer.callback_metrics
-            loss_per_codebook = trainer.callback_metrics.get("loss_per_codebook", None)
+            loss_per_codebook = getattr(pl_module, "val_codebook_epoch_loss", None)
 
         if loss_per_codebook is None:
             return
+        
+        # gather losses from all GPUs if distributed
+        if isinstance(loss_per_codebook, list):
+            # stack into (num_devices, num_codebooks)
+            loss_per_codebook = torch.stack(loss_per_codebook, dim=0).mean(dim=0)
 
-        # Convert to CPU and numpy
         if isinstance(loss_per_codebook, torch.Tensor):
             loss_per_codebook = loss_per_codebook.detach().cpu().numpy()
 
-        # Report each codebook line to the same ClearML graph
         for i, val in enumerate(loss_per_codebook):
             task.get_logger().report_scalar(
                 title=f"{self.title}_per_epoch",
                 series=f"{self.mode}_codebook_{i+1}",
                 value=float(val),
                 iteration=trainer.current_epoch,
+            )
+
+class CurriculumCallback(pl.Callback):
+    def __init__(self, collator, n_query, start_epoch=0, end_epoch=20, task=None):
+        self.collator = collator
+        self.n_query = n_query
+        self.start_epoch = start_epoch
+        self.end_epoch = end_epoch
+        self.task_logger = task.get_logger() if task is not None else None
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        # linear schedule: gradually increase from 1 to n_query
+        res = min(1 + ((epoch - self.start_epoch) * self.n_query) // (self.end_epoch - self.start_epoch), self.n_query)
+        current_mask_num = res if res > 0 else None
+        self.collator.set_current_mask_num(current_mask_num)
+        # logger.debug(f"[Curriculum] Epoch {epoch}: setting mask_num = {current_mask_num}")
+        
+        if self.task_logger is not None:
+            value_to_report = current_mask_num if current_mask_num is not None else -1
+            self.task_logger.report_scalar(
+                title="Curriculum Mask", 
+                series="mask_num",
+                value=value_to_report, 
+                iteration=epoch
             )
 
 
@@ -280,6 +297,20 @@ def train(cfg: DictConfig):
     codebook_logger_val = ClearMLCodebookLogger(title="val_codebook_loss", mode="val")
     callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger, codebook_logger_train, codebook_logger_val]
 
+    if cfg.train.get("enable_curriculum", False):
+        assert cfg.train.training_mode == "masked", "Curriculum learning only makes sense with masked training"
+        assert cfg.train.curriculum_end_epoch <= cfg.train.max_epochs, "Curriculum end epoch must be <= max epochs"
+        logger.info("Curriculum learning enabled")
+        # For now, curriculum starts at epoch 0
+        curriculum_callback = CurriculumCallback(
+            collator=train_dataloader.collate_fn, 
+            n_query=cfg.n_query, 
+            start_epoch=cfg.train.curriculum_start_epoch,
+            end_epoch=cfg.train.curriculum_end_epoch,
+            task=task,
+        )
+        callbacks.append(curriculum_callback)
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices="auto",
@@ -297,7 +328,26 @@ def train(cfg: DictConfig):
         inference_mode=False,
     )
 
-    logger.info("Total number of steps: {}".format(trainer.estimated_stepping_batches))
+    # logger.info("Total number of steps: {}".format(trainer.estimated_stepping_batches))
+
+    tuner = Tuner(trainer)
+    lr_finder = tuner.lr_find(
+        pl_module, 
+        train_dataloaders=train_dataloader,
+        val_dataloaders=valid_dataloader,
+        min_lr=1e-6, 
+        max_lr=1.0, 
+        num_training=100,
+    )
+    fig = lr_finder.plot(suggest=True)
+    fig.show()
+    try:
+        fig.savefig(os.path.join(cfg.output_dir, "lr_finder_plot.png"))
+    except:
+        pass
+    new_lr = lr_finder.suggestion()
+    logger.info("Suggested LR: %s", new_lr)
+    pl_module.lr = new_lr
 
     start_time = time.time()
     trainer.fit(
@@ -315,6 +365,8 @@ def train(cfg: DictConfig):
     #     logger.debug("Model state dict after training: \n{}".format(model.state_dict()))
 
     if task is not None:
+        task.get_logger().report_single_value('learning_rate', new_lr if new_lr is not None else cfg.train.learning_rate)
+        task.get_logger().report_single_value('best_eval_loss', checkpoint.best_model_score.item())
         task.get_logger().report_single_value('training_time', training_time)
 
     return trainer, pl_module, tokenizer, task

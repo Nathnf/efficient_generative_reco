@@ -229,12 +229,14 @@ def train(cfg: DictConfig):
         model_config.save(cfg.output_dir)
         logger.debug("model.t5_model.state_dict(): {}".format(model.t5_model.state_dict()))
         log_embedding_tables(cfg, model)
+        if task is not None:
+            task.get_logger().report_single_value('learning_rate', cfg.train.learning_rate)
 
 
 
 @hydra.main(
     version_base=None,
-    config_path="../../conf/tiger",
+    config_path="../../conf/parallel_tiger",
     config_name="train_config.yaml",
 )
 def main(cfg: DictConfig):

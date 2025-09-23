@@ -186,6 +186,7 @@ def train(cfg: DictConfig):
     logger.info(f"Training time: {training_time} seconds")
     if task is not None and local_rank == 0:
         task.get_logger().report_single_value('training_time', training_time)
+        task.get_logger().report_single_value('learning_rate', cfg.train.learning_rate)
 
     model.save_pretrained(
         cfg.output_dir, 

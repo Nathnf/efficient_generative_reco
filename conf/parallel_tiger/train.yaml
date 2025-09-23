@@ -35,21 +35,28 @@ train:
   log_codebook_losses: true
 
 model:
+  # # Model architecture hyperparameters if training from scratch
+  # # The default values match Hugging Face's T5Config for the T5-small model.
+  # d_model: 512
+  # d_kv: 64
+  # d_ff: 2048
+  # num_layers: 6
+  # num_heads: 8
   # Model architecture hyperparameters if training from scratch
-  # The default values match Hugging Face's T5Config for the T5-small model.
-  d_model: 512
+  # The default values match TIGER architecture.
+  d_model: 128
   d_kv: 64
-  d_ff: 2048
-  num_layers: 6
-  num_heads: 8
+  d_ff: 1024
+  num_layers: 4
+  num_heads: 6
   relative_attention_num_buckets: 32
   relative_attention_max_distance: 128
   dropout_rate: 0.1
   layer_norm_epsilon: 1e-6
 
   tie_word_embeddings: false # argument to tie input (`shared`) and output (`lm_head`) projection layers, in the single head case
-  has_relative_encoder_item_bias: true
-  has_relative_encoder_codebook_bias: true
+  has_relative_encoder_item_bias: false
+  has_relative_encoder_codebook_bias: false
   has_relative_decoder_item_bias_sa: true
   has_relative_decoder_codebook_bias_sa: true
   has_relative_decoder_item_bias_ca: false

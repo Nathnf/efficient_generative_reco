@@ -241,8 +241,8 @@ class BaseRQTransformer(nn.Module):
             attention_mask[i, -num_paddings:] = 1
         spatial_tokens_extended, attention_mask_extended = self._insert_start_token(spatial_tokens, attention_mask, start_token)
         spatial_tokens_extended_unvector, attention_mask_extended_unvector = self._insert_start_token_unvectorized(spatial_tokens, attention_mask, start_token)
-        assert torch.equal(spatial_tokens_extended, spatial_tokens_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for spatial_tokens"
-        assert torch.equal(attention_mask_extended, attention_mask_extended_unvector), "_spatial_forward: _insert_start_token and _insert_start_token_unvectorized do not give the same result for attention_mask"
+        assert torch.equal(spatial_tokens_extended, spatial_tokens_extended_unvector), "_insert_start_token and _insert_start_token_unvectorized do not give the same result for spatial_tokens"
+        assert torch.equal(attention_mask_extended, attention_mask_extended_unvector), "_insert_start_token and _insert_start_token_unvectorized do not give the same result for attention_mask"
 
     def _spatial_forward(self, ids, attention_mask):
         # require flattened input for compability with MQL4GRec data collator
@@ -280,13 +280,64 @@ class BaseRQTransformer(nn.Module):
         labels = labels.view(-1)  # (b * s * d,) if training or (b * d,) if validation/inference
         outer_dim = labels.shape[0] // self.depth_seq_len  # b*s if training, b if validation/inference
         offset = torch.arange(self.depth_seq_len, device=labels.device) * self.num_tokens
+        # print(f"First labels: {labels[:30]}")
         labels = torch.where(
             labels == self.pad_id,
             -100,
             labels - offset.repeat(outer_dim).to(labels.device) - self.num_special_tokens,
         )
+        # print(f"First adapted labels: {labels[:30]}")
         return labels
     
+    # def _compute_loss_with_mask(
+    #     self,
+    #     preds,
+    #     labels,
+    #     use_query_vectors_mask,
+    #     depth_seq_len,
+    # ):
+    #     """
+    #     Compute the cross-entropy loss with optional masking of certain query vectors.
+    #     Adapted to both training case (b, s, d) and validation case (b, d).
+    #     NOTE: 
+    #     - The masking is only used for the `RQQTransformer` model, when training with partial query vectors.
+    #     - RQTransformer always uses all query vectors, so `use_query_vectors_mask` is always None.
+
+    #     preds: (N, num_tokens) where N = b*d or b*s*d
+    #     labels: (N,)
+    #     use_query_vectors_mask: None, or (b, d) / (b, s, d)
+    #         - True indicates that the corresponding query vector was used (not masked)
+    #         - False indicates that the corresponding query vector was not used (masked). Instead, the ground truth token was provided as input to the model. No loss should be computed for these inputs.
+    #     depth_seq_len: int
+    #     """
+
+        # if use_query_vectors_mask is not None:
+        #     use_query_vectors_mask_flat = use_query_vectors_mask.flatten()
+        #     labels = torch.where(
+        #         use_query_vectors_mask_flat,
+        #         labels,
+        #         -100
+        #     )
+
+    #         # compute loss weights normalized per sample
+    #         num_masked_per_sample = use_query_vectors_mask.sum(dim=-1)  # (b,) or (b, s)
+    #         loss_weights = torch.where(
+    #             use_query_vectors_mask,
+    #             1.0 / num_masked_per_sample.unsqueeze(-1).float(),  # safe by construction
+    #             0.0
+    #         ).flatten()
+    #     else:
+    #         loss_weights = torch.ones_like(labels, dtype=torch.float32)
+
+    #     loss = F.cross_entropy(
+    #         preds, labels, ignore_index=-100, reduction="none"
+    #     ) * loss_weights
+
+    #     loss_per_codebook = loss.view(-1, depth_seq_len).sum(dim=0)  # (d,)
+    #     loss_per_codebook = loss_per_codebook / preds.size(0)
+
+    #     return loss.mean(), loss_per_codebook
+
     def _compute_loss_with_mask(
         self,
         preds,
@@ -295,44 +346,37 @@ class BaseRQTransformer(nn.Module):
         depth_seq_len,
     ):
         """
-        Compute the cross-entropy loss with optional masking of certain query vectors.
-        Adapted to both training case (b, s, d) and validation case (b, d).
-        NOTE: 
-        - The masking is only used for the `RQQTransformer` model, when training with partial query vectors.
-        - RQTransformer always uses all query vectors, so `use_query_vectors_mask` is always None.
-
-        preds: (N, num_tokens) where N = b*d or b*s*d
+        preds: (N, vocab_size) where N = b*d or b*s*d
         labels: (N,)
         use_query_vectors_mask: None, or (b, d) / (b, s, d)
+            - True → query vector used (loss computed)
+            - False → ground truth given, no loss
         depth_seq_len: int
         """
 
-        if use_query_vectors_mask is not None:
-            use_query_vectors_mask_flat = use_query_vectors_mask.flatten()
-            labels = torch.where(
-                use_query_vectors_mask_flat,
-                labels,
-                -100
-            )
-
-            # compute loss weights normalized per sample
-            num_masked_per_sample = use_query_vectors_mask.sum(dim=-1)  # (b,) or (b, s)
-            loss_weights = torch.where(
-                use_query_vectors_mask,
-                1.0 / num_masked_per_sample.unsqueeze(-1).float(),  # safe by construction
-                0.0
-            ).flatten()
-        else:
-            loss_weights = torch.ones_like(labels, dtype=torch.float32)
-
-        loss = F.cross_entropy(
+        # Compute per-position CE loss, unreduced
+        per_pos_loss = F.cross_entropy(
             preds, labels, ignore_index=-100, reduction="none"
-        ) * loss_weights
+        )  # (N,)
 
-        loss_per_codebook = loss.view(-1, depth_seq_len).sum(dim=0)  # (d,)
-        loss_per_codebook = loss_per_codebook / preds.size(0)
+        # Reshape to (..., d), where ... = batch or batch × seq_len
+        loss = per_pos_loss.view(-1, depth_seq_len)  # (B, d), B = b or b*s
 
-        return loss.mean(), loss_per_codebook
+        if use_query_vectors_mask is not None:
+            mask = use_query_vectors_mask.reshape(-1, depth_seq_len).float()  # (B, d)
+        else:
+            mask = torch.ones_like(loss, dtype=torch.float)
+
+        # ---- Final loss with per-sample normalization ----
+        loss_sum = (loss * mask).sum(dim=-1)          # (B,)
+        mask_count = mask.sum(dim=-1)                 # (B,)
+        loss_per_sample = loss_sum / mask_count.clamp(min=1)
+        final_loss = loss_per_sample.mean()
+
+        # ---- Logging: loss per codebook ----
+        loss_per_codebook = (loss * mask).sum(dim=0) / mask.sum(dim=0).clamp(min=1)
+
+        return final_loss, loss_per_codebook  # scalar, (d,)
 
     def _local_to_global_id(self, local_id, depth_idx):
         return local_id + depth_idx * self.num_tokens + self.num_special_tokens
@@ -390,7 +434,20 @@ class LitRQQTransformer(pl.LightningModule):
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed, batch_size=ids.size(0))
         # for i, l in enumerate(loss_per_codebook): # creates a graph per codebook on ClearML...
         #     self.log(f"train_loss_codebook_{i+1}", l, prog_bar=False, on_step=False, on_epoch=True, sync_dist=self.distributed)
-        self.loss_per_codebook = loss_per_codebook # to be fetched by a custom ClearML callback
+        
+        # # accumulate train codebook losses (to be fetched by a callback at epoch end)
+        # if not hasattr(self, "train_codebook_losses"):
+        #     self.train_codebook_losses = []
+        # self.train_codebook_losses.append(loss_per_codebook.detach().cpu())
+
+        if not hasattr(self, "train_codebook_loss_sum"):
+            self.train_codebook_loss_sum = torch.zeros_like(loss_per_codebook.detach().cpu())
+            self.train_codebook_loss_count = 0
+        if isinstance(loss_per_codebook, list):  # DDP case
+            loss_per_codebook = torch.stack(loss_per_codebook).mean(0)
+        self.train_codebook_loss_sum += loss_per_codebook.detach().cpu()
+        self.train_codebook_loss_count += 1
+
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -399,7 +456,21 @@ class LitRQQTransformer(pl.LightningModule):
         self.log("eval_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed, batch_size=ids.size(0))
         # for i, l in enumerate(loss_per_codebook): # idem
         #     self.log(f"eval_loss_codebook_{i+1}", l, prog_bar=False, on_step=False, on_epoch=True, sync_dist=self.distributed)
-        self.loss_per_codebook = loss_per_codebook # idem
+        
+        # # idem
+        # if not hasattr(self, "val_codebook_losses"):
+        #     self.val_codebook_losses = []
+        # print(f"self.val_codebook_losses before append: {self.val_codebook_losses}")
+        # self.val_codebook_losses.append(loss_per_codebook.detach().cpu())
+
+        if not hasattr(self, "val_codebook_loss_sum"):
+            self.val_codebook_loss_sum = torch.zeros_like(loss_per_codebook.detach().cpu())
+            self.val_codebook_loss_count = 0
+        if isinstance(loss_per_codebook, list):  # DDP case
+            loss_per_codebook = torch.stack(loss_per_codebook).mean(0)
+        self.val_codebook_loss_sum += loss_per_codebook.detach().cpu()
+        self.val_codebook_loss_count += 1
+
         return loss
 
     def predict_step(self, batch, batch_idx):
@@ -420,4 +491,26 @@ class LitRQQTransformer(pl.LightningModule):
             "targets": targets,
             "users": users
         }
+
+    def on_train_epoch_end(self):
+        # if hasattr(self, "train_codebook_losses"):
+        #     self.train_codebook_losses = torch.stack(self.train_codebook_losses).mean(0)
+        if hasattr(self, "train_codebook_loss_sum") and self.train_codebook_loss_count > 0:
+            mean_loss = self.train_codebook_loss_sum / self.train_codebook_loss_count
+            self.train_codebook_epoch_loss = mean_loss  # tensor ready for ClearML
+        # reset
+        del self.train_codebook_loss_sum
+        del self.train_codebook_loss_count
+        super().on_train_epoch_end()
+
+    def on_validation_epoch_end(self):
+        # if hasattr(self, "val_codebook_losses"):
+        #     self.val_codebook_losses = torch.stack(self.val_codebook_losses).mean(0)
+        if hasattr(self, "val_codebook_loss_sum") and self.val_codebook_loss_count > 0:
+            mean_loss = self.val_codebook_loss_sum / self.val_codebook_loss_count
+            self.val_codebook_epoch_loss = mean_loss  # tensor ready for ClearML
+        # reset
+        del self.val_codebook_loss_sum
+        del self.val_codebook_loss_count
+        super().on_validation_epoch_end()
 

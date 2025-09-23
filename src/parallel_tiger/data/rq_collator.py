@@ -1,3 +1,4 @@
+import random
 import torch
 from parallel_tiger.model.config import TrainingMode
 
@@ -26,6 +27,12 @@ class TrainCollator(BaseCollator):
 
     def __init__(self, cfg, tokenizer):
         super().__init__(cfg, tokenizer)
+        self.masked_mix_prob = float(getattr(cfg.train, 'masked_mix_prob', 1.0))
+        self.current_mask_num = None
+
+    def set_current_mask_num(self, current_mask_num):
+        """Used by training loop to control curriculum learning of masking"""
+        self.current_mask_num = current_mask_num
 
     def __call__(self, batch):
         # logger.debug("batch:", batch)
@@ -49,7 +56,7 @@ class TrainCollator(BaseCollator):
         inputs["input_ids"] = inputs["input_ids"].view(bs, n_items, self.n_query)
         inputs["attention_mask"] = inputs["attention_mask"].view(bs, n_items, self.n_query)
 
-        if not self.masked_training:
+        if not self.masked_training or (random.random() > self.masked_mix_prob):
             # NOTE: return plain dict, BatchEncoding may drop non-tensor keys like None during collation
             return {
                 "input_ids": inputs["input_ids"].view(bs, n_items, self.n_query),
@@ -59,14 +66,19 @@ class TrainCollator(BaseCollator):
 
         else:
             # For each item, choose a random number of tokens AND positions to mask
-            # NOTE: Mask means that the model should predict these tokens
+            # NOTE: 
+            # - Mask means that the model should predict these tokens (True)
+            # - Unmask means that the model is given the ground truth token (False). No loss should be computed for these tokens.
             tokens = inputs["input_ids"]  # (bs, n_items, n_query)
             bs, n_items, n_query = tokens.shape
             device = tokens.device
 
             use_query_vectors_mask = torch.zeros_like(tokens, dtype=torch.bool)  # (bs, n_items, n_query)
 
-            mask_token_no = torch.randint(1, n_query + 1, (bs, n_items), device=device)  # number of tokens to mask in each sample: (bs, n_items)
+            if self.current_mask_num is None:
+                mask_token_no = torch.randint(1, n_query + 1, (bs, n_items), device=device)  # number of tokens to mask in each sample: (bs, n_items)
+            else:
+                mask_token_no = torch.full((bs, n_items), self.current_mask_num, device=device, dtype=torch.long)  # (bs, n_items)
 
             # Generate random noise and argsort to get permutations
             noise = torch.rand(bs, n_items, n_query, device=device)  # (bs, n_items, n_query)
@@ -101,6 +113,7 @@ class ValidationCollator(BaseCollator):
 
     def __init__(self, cfg, tokenizer):
         super().__init__(cfg, tokenizer)
+        self.masked_mix_prob = float(getattr(cfg.train, 'masked_mix_prob', 1.0))
 
     def __call__(self, batch):
 
@@ -137,7 +150,7 @@ class ValidationCollator(BaseCollator):
         inputs["input_ids"] = inputs["input_ids"].view(bs, n_items, self.n_query)
         inputs["attention_mask"] = inputs["attention_mask"].view(bs, n_items, self.n_query)
 
-        if not self.masked_training:
+        if not self.masked_training or (random.random() > self.masked_mix_prob):
             # NOTE: return plain dict, BatchEncoding may drop non-tensor keys like None during collation
             return {
                 "input_ids": inputs["input_ids"],
@@ -152,7 +165,9 @@ class ValidationCollator(BaseCollator):
 
         else:
             # For each label item, choose a random number of tokens AND positions to mask
-            # NOTE: Mask means that the model should predict these tokens
+            # NOTE: 
+            # - Mask means that the model should predict these tokens (True)
+            # - Unmask means that the model is given the ground truth token (False). No loss should be computed for these tokens.
             bs, n_query = labels["input_ids"].shape
             device = labels["input_ids"].device
             use_query_vectors_mask = torch.zeros((bs, n_query), dtype=torch.bool).to(

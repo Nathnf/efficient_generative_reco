@@ -31,7 +31,7 @@ train:
   group_by_length: false
 
   enable_clearml: true
-  is_pretrained_model: true
+  is_pretrained_model: false
   log_codebook_losses: true
 
 model:

@@ -193,6 +193,8 @@ def test_ddp(cfg: DictConfig):
 
     metrics = cfg.infer.metrics.split(",")
     all_prompt_results = []
+    inference_time = []
+
     with torch.no_grad():
 
         for prompt_id in prompt_ids:
@@ -211,12 +213,16 @@ def test_ddp(cfg: DictConfig):
                 bs = len(targets)
                 num_beams = cfg.infer.num_beams
 
+                start = t.perf_counter()
                 output = model.module.generate(
                     input_ids=inputs["input_ids"],
                     input_mask=inputs["attention_mask"],
                     topK=num_beams,
                     use_constraints=cfg.infer.use_constraints,
                 )
+                torch.cuda.synchronize()
+                end = t.perf_counter()
+                inference_time.append(end - start)
 
                 output_ids = output["sequences"]  # (bs, num_beams, seq_len)
                 scores = output["sequences_scores"]  # (bs, num_beams)
@@ -336,13 +342,21 @@ def test_ddp(cfg: DictConfig):
         logger.info("Save file: {}".format(cfg.infer.results_file))
 
         if task is not None:
+            total_infer_time = sum(inference_time)
+            logger.info(f"Total inference time (s): {total_infer_time:.2f}")
+            logger.info(f"Number of inference calls: {len(inference_time)}")
+            logger.info(f"Mean inference time per call (s): {total_infer_time / len(inference_time):.4f}")
             # --- ClearML: log aggregated metrics ---
             for m in metrics:
                 task.get_logger().report_scalar("Mean Results", m, mean_results[m], iteration=0)
+                task.get_logger().report_single_value(f"Mean_{m}", mean_results[m])
                 task.get_logger().report_scalar("Min Results", m, min_results[m], iteration=0)
                 task.get_logger().report_scalar("Max Results", m, max_results[m], iteration=0)
             # task.upload_artifact("evaluation_results", save_data) # comment line because it creates a deadlock
             # TODO: solve issue. See https://github.com/clearml/clearml-agent/issues/73 
+
+            task.get_logger().report_single_value("Mean Inference Time (s)", total_infer_time)
+            task.get_logger().report_single_value("Mean Inference Time per call (s)", total_infer_time / len(inference_time))
             task.close()
             logger.info("ClearML task closed.")
 

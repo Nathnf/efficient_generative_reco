@@ -3,7 +3,7 @@ n_query: 4
 code_num: 256
 base_model: "google-t5/t5-small"
 cache_dir: "/home/n.fredholm/sync/SETRec/.cache"
-custom_tokenizer: true
+custom_tokenizer: false
 # load_model_name: null
 quantizer_type: "rqvae"
 project_name: "TIGER"

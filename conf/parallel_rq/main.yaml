@@ -46,6 +46,7 @@ train:
   enable_curriculum: false # Whether to use curriculum learning for masked training
   curriculum_start_epoch: 0 # Epoch to start curriculum learning
   curriculum_end_epoch: 20 # Epoch to end curriculum learning
+  tune_learning_rate: false
 
   # optim: "adamw_torch"
 
@@ -75,11 +76,11 @@ infer:
   sample_num: -1  # test sample number, -1 represents using all test data
   filter_items: true
   use_constraints: true
-  first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}_.pt"
-  transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}_.pt"
-  transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}_.pt"
-  prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}_.pt"
-  uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}_.pt"
+  first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
+  prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
+  uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
   overfit_test: false # Whether to try to overfit test data (for debugging purposes)
 
 #   results_file: "${infer.output_dir}/results_${infer.test_task}_${infer.num_beams}.json"

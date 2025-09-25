@@ -56,6 +56,7 @@ from parallel_tiger.evaluation.metrics import get_metrics_results, get_topk_resu
 
 
 logging.getLogger("fsspec").setLevel(logging.WARNING)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -329,25 +330,27 @@ def train(cfg: DictConfig):
     )
 
     # logger.info("Total number of steps: {}".format(trainer.estimated_stepping_batches))
-
-    tuner = Tuner(trainer)
-    lr_finder = tuner.lr_find(
-        pl_module, 
-        train_dataloaders=train_dataloader,
-        val_dataloaders=valid_dataloader,
-        min_lr=1e-6, 
-        max_lr=1.0, 
-        num_training=100,
-    )
-    fig = lr_finder.plot(suggest=True)
-    fig.show()
-    try:
-        fig.savefig(os.path.join(cfg.output_dir, "lr_finder_plot.png"))
-    except:
-        pass
-    new_lr = lr_finder.suggestion()
-    logger.info("Suggested LR: %s", new_lr)
-    pl_module.lr = new_lr
+    new_lr = None
+    if cfg.train.tune_learning_rate:
+        logger.info("Tuning learning rate...")
+        tuner = Tuner(trainer)
+        lr_finder = tuner.lr_find(
+            pl_module, 
+            train_dataloaders=train_dataloader,
+            val_dataloaders=valid_dataloader,
+            min_lr=1e-6, 
+            max_lr=1.0, 
+            num_training=100,
+        )
+        fig = lr_finder.plot(suggest=True)
+        fig.show()
+        try:
+            fig.savefig(os.path.join(cfg.output_dir, "lr_finder_plot.png"))
+        except:
+            pass
+        new_lr = lr_finder.suggestion()
+        logger.info("Suggested LR: %s", new_lr)
+        pl_module.lr = new_lr
 
     start_time = time.time()
     trainer.fit(

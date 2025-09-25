@@ -113,7 +113,7 @@ def train(cfg: DictConfig):
         logger.info("add {} new token.".format(add_num))
         logger.info("data num: {}".format(len(train_data)))
         logger.info("Model Embedding shape: {}".format(model.shared.weight.shape))
-        logger.info("Tokenizer vocab map: {}".format(tokenizer.get_vocab()))
+        # logger.info("Tokenizer vocab map: {}".format(tokenizer.get_vocab()))
         tokenizer.save_pretrained(cfg.output_dir)
         model_config.save(cfg.output_dir)
         logger.info("train sequence")

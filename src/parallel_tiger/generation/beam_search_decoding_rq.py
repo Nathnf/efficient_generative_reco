@@ -74,7 +74,7 @@ def _get_valid_mask(
                     valid_mask[b, prev_beam, valid_tokens] = True
         return valid_mask
 
-    logger.info("Careful, no transition masks found for step {}. Resorting to unconstrained search.".format(t))
+    # logger.info("Careful, no transition masks found for step {}. Resorting to unconstrained search.".format(t))
     return torch.ones((bs, k, codebook_num), dtype=torch.bool, device=device)
 
 

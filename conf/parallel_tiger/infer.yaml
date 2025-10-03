@@ -1,5 +1,6 @@
 infer: 
   experiment_name: "${exp_name}_inference"
+  suffix: ""  # Suffix to add to ClearML task name
   generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search' (autoregressive not supported yet)
   ckpt_dir: "${output_dir}"
   output_dir: "${output_dir}/inference/${infer.generation_mode}" # NOT USED CURRENTLY?
@@ -15,6 +16,7 @@ infer:
   transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
   prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
   uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
+  per_level_stats: false
 
   sample_num: -1  # test sample number, -1 represents using all test data
   gpu_id: 0

@@ -25,7 +25,7 @@ train:
   training_mode: "standard"
   batch_size: 1024 # 2048 slightly too large for 2 V100 GPUs on the Arts dataset
   batch_size_eval: 2048
-  learning_rate: 1e-2
+  learning_rate: 1e-3
   weight_decay: 0.01
   lr_scheduler: "cosine"
   warmup_steps: 100
@@ -40,13 +40,18 @@ train:
   limit_val_batches: 1.0 # full validation 
   tasks: "seqrec" # Downstream tasks, separate by comma
   valid_task: "seqrec"
-  train_and_val_sample_num: -1 # Number of samples to use for training and validation, -1 means using all data - Useful to see if the model overfits on small data
+  train_sample_num: -1 # Number of samples to use for training, -1 means using all data - Useful to see if the model overfits on small data
+  val_sample_num: 10_000
+  test_sample_num: -1
   overfit_val: false # Whether to try to overfit validation data (for debugging purposes)
   masked_mix_prob: 1.0 # Probability of using masked training in each batch (1.0 means only masked training, 0.0 means only standard training)
   enable_curriculum: false # Whether to use curriculum learning for masked training
   curriculum_start_epoch: 0 # Epoch to start curriculum learning
   curriculum_end_epoch: 20 # Epoch to end curriculum learning
   tune_learning_rate: false
+  log_codebook_losses: true
+  compute_val_metrics: true # Whether to compute validation metrics during training
+
 
   # optim: "adamw_torch"
 
@@ -67,6 +72,14 @@ model:
   attention_type: "full"
   
 
+valid:
+  first_token_constraints_path: "${dataset.data_path}/${dataset.name}/valid/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/valid/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/valid/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
+  prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/valid/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
+  uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/valid/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
+
+
 infer: 
   metrics: "hit@1,hit@5,hit@10,ndcg@5,ndcg@10"  # test metrics, separate by comma
   generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search'
@@ -82,6 +95,7 @@ infer:
   prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
   uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
   overfit_test: false # Whether to try to overfit test data (for debugging purposes)
+  per_level_stats: false
 
 #   results_file: "${infer.output_dir}/results_${infer.test_task}_${infer.num_beams}.json"
 #   save_file: "${infer.output_dir}/save_${infer.test_task}_${infer.num_beams}.json"

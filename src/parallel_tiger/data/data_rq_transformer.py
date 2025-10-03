@@ -31,7 +31,9 @@ class SeqRecDataset(BaseDataset):
 
         self.mode = mode
         self.prompt_id = prompt_id
-        self.train_and_val_sample_num = cfg.train.train_and_val_sample_num
+        self.train_sample_num = cfg.train.get("train_sample_num", -1)
+        self.val_sample_num = cfg.train.get("val_sample_num", -1)
+        self.test_sample_num = cfg.train.get("test_sample_num", -1)
         self.overfit_val = cfg.train.overfit_val
         self.overfit_test = cfg.infer.overfit_test
         self.sample_num = sample_num
@@ -58,6 +60,8 @@ class SeqRecDataset(BaseDataset):
             raise NotImplementedError
 
         logger.info("task: {}".format(self.task))
+        logger.info("Sample config: {}".format(self.get_sample_config_info()))
+        logger.info("Final dataset size: {}".format(len(self.inter_data)))
         logger.info("train_data[0]: {}".format(self.__getitem__(0)))
         logger.info("train_data[4]: {}".format(self.__getitem__(4)))
 
@@ -101,20 +105,64 @@ class SeqRecDataset(BaseDataset):
                 new_items = [self.indices[str(i)] for i in items]
                 self.remapped_inters[uid] = new_items
     
-    def _maybe_sample(self, inter_data):
-        if self.train_and_val_sample_num > 0 and len(inter_data) > self.train_and_val_sample_num:
-            if self.overfit_val or self.overfit_test:
-                # same training and validation sequences
-                sample_idx = range(self.train_and_val_sample_num)
+    def _maybe_sample(self, inter_data, mode=None):
+        """
+        Sample data based on mode-specific sample numbers.
+        
+        Args:
+            inter_data: List of data samples
+            mode: 'train', 'valid', or 'test'. If None, uses self.mode
+        
+        Returns:
+            Sampled inter_data
+        """
+        if mode is None:
+            mode = self.mode
+            
+        # Determine sample number based on mode
+        if mode == "train":
+            sample_num = self.train_sample_num
+            use_overfit = False  # Training doesn't use overfit logic
+        elif mode == "valid":
+            sample_num = self.val_sample_num
+            use_overfit = self.overfit_val
+        elif mode == "test":
+            sample_num = self.test_sample_num
+            use_overfit = self.overfit_test
+        else:
+            sample_num = -1
+            use_overfit = False
+            
+        # Apply sampling if needed
+        if sample_num > 0 and len(inter_data) > sample_num:
+            if use_overfit:
+                # Same sequences for overfitting
+                sample_idx = range(sample_num)
             else:
+                # Random sampling for normal training/validation
                 all_idx = range(len(inter_data))
-                sample_idx = np.random.choice(all_idx, self.train_and_val_sample_num, replace=False)
+                sample_idx = np.random.choice(all_idx, sample_num, replace=False)
+            
             inter_data = np.array(inter_data, dtype=object)[sample_idx].tolist()
 
-            if self.train_and_val_sample_num < 11:
-                logger.info(f"Sampled data: {inter_data}")
-                logger.info(f"Sampled data length: {len(inter_data)}")
+            # Debug logging for small samples
+            if sample_num < 11:
+                logger.info(f"Sampled {mode} data: {inter_data}")
+                logger.info(f"Sampled {mode} data length: {len(inter_data)}")
+            else:
+                logger.info(f"Sampled {len(inter_data)} {mode} samples from original {len(inter_data)} samples")
+                
         return inter_data
+
+    def get_sample_config_info(self):
+        """Return information about current sampling configuration for debugging."""
+        return {
+            "train_sample_num": self.train_sample_num,
+            "val_sample_num": self.val_sample_num,
+            "overfit_val": self.overfit_val,
+            "overfit_test": self.overfit_test,
+            "mode": self.mode,
+        }
 
     def _process_train_data(self):
         """
@@ -141,7 +189,7 @@ class SeqRecDataset(BaseDataset):
                 "inters": history_items
             })
 
-        return self._maybe_sample(inter_data)
+        return self._maybe_sample(inter_data, mode="train")
 
     def _process_valid_data(self):
 
@@ -159,7 +207,7 @@ class SeqRecDataset(BaseDataset):
             one_data["inters"] = history
             inter_data.append(one_data)
 
-        return self._maybe_sample(inter_data)
+        return self._maybe_sample(inter_data, mode="valid")
 
     def _process_test_data(self):
 
@@ -183,7 +231,7 @@ class SeqRecDataset(BaseDataset):
             # print(sample_idx[:10])##################
             inter_data = np.array(inter_data)[sample_idx].tolist()
 
-        return self._maybe_sample(inter_data)
+        return self._maybe_sample(inter_data, mode="test")
 
     def __len__(self):
         return len(self.inter_data)

@@ -390,24 +390,21 @@ class LitRQQTransformer(pl.LightningModule):
     def __init__(
         self, 
         model, 
-        lr=1e-3, 
-        weight_decay=1e-2, 
-        lr_scheduler_type='linear', 
-        warmup_steps=100, 
+        cfg,
         distributed=True,
-        topK=20,
-        use_constraints=True,
     ):
         super().__init__()
         self.model = model
-        self.lr = lr
-        self.weight_decay = weight_decay
-        self.lr_scheduler_type = lr_scheduler_type
-        self.warmup_steps = warmup_steps
+        self.cfg = cfg
+        self.lr = cfg.train.learning_rate
+        self.weight_decay = cfg.train.weight_decay
+        self.lr_scheduler_type = cfg.train.lr_scheduler
+        self.warmup_steps = cfg.train.warmup_steps
         self.distributed = distributed
-        self.topK = topK
-        self.use_constraints = use_constraints
-        # self.save_hyperparameters()
+        self.topK = cfg.infer.num_beams
+        self.use_constraints = cfg.infer.use_constraints
+        print(f"Using constraints in generation: {self.use_constraints}")
+        # # self.save_hyperparameters()
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
@@ -452,17 +449,10 @@ class LitRQQTransformer(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         ids, attention_mask, labels, use_query_vectors_mask = batch["input_ids"], batch["attention_mask"], batch["labels"], batch["use_query_vectors_mask"]
-        loss, loss_per_codebook = self.model.forward_validation(ids, attention_mask, labels, use_query_vectors_mask)
+        loss, loss_per_codebook, logits = self.model.forward_validation(ids, attention_mask, labels, use_query_vectors_mask)
         self.log("eval_loss", loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=self.distributed, batch_size=ids.size(0))
-        # for i, l in enumerate(loss_per_codebook): # idem
-        #     self.log(f"eval_loss_codebook_{i+1}", l, prog_bar=False, on_step=False, on_epoch=True, sync_dist=self.distributed)
         
-        # # idem
-        # if not hasattr(self, "val_codebook_losses"):
-        #     self.val_codebook_losses = []
-        # print(f"self.val_codebook_losses before append: {self.val_codebook_losses}")
-        # self.val_codebook_losses.append(loss_per_codebook.detach().cpu())
-
+        # Accumulate validation codebook losses
         if not hasattr(self, "val_codebook_loss_sum"):
             self.val_codebook_loss_sum = torch.zeros_like(loss_per_codebook.detach().cpu())
             self.val_codebook_loss_count = 0
@@ -470,6 +460,49 @@ class LitRQQTransformer(pl.LightningModule):
             loss_per_codebook = torch.stack(loss_per_codebook).mean(0)
         self.val_codebook_loss_sum += loss_per_codebook.detach().cpu()
         self.val_codebook_loss_count += 1
+
+        # Store predictions for metrics computation (only if callback is enabled)
+        if self.cfg.train.get("compute_val_metrics", False):
+            output = self.model.generate(
+                ids,
+                attention_mask,
+                self.topK,
+                self.use_constraints
+            )
+            
+            # Store for potential metrics computation by callback
+            if not hasattr(self, 'val_predictions'):
+                self.val_predictions = []
+            
+            # Extract user info if available (you might need to adjust this based on your batch structure)
+            users = batch.get("users", [None] * len(labels))
+            
+            self.val_predictions.append({
+                "preds": output["sequences"],  # (bs, num_beams, seq_len)
+                "scores": output["sequences_scores"],  # (bs, num_beams)
+                "targets": labels.tolist(),  # Convert to list for easier processing
+                "users": users
+            })
+
+            if self.cfg.get("model_type", "rqqt").lower() == "rqt":
+                # Teacher forcing generation - use same context as free-running
+                teacher_forcing_output = self.model.generate_teacher_forcing(
+                    ids,
+                    attention_mask,
+                    self.topK,
+                    self.use_constraints
+                )
+                
+                # Store for potential metrics computation by callback
+                if not hasattr(self, 'val_predictions_teacher_forcing'):
+                    self.val_predictions_teacher_forcing = []
+                
+                self.val_predictions_teacher_forcing.append({
+                    "preds": teacher_forcing_output["sequences"],  # (bs, num_beams, seq_len)
+                    "scores": teacher_forcing_output["sequences_scores"],  # (bs, num_beams)
+                    "targets": labels.tolist(),  # Convert to list for easier processing
+                    "users": users
+                })
 
         return loss
 
@@ -493,24 +526,34 @@ class LitRQQTransformer(pl.LightningModule):
         }
 
     def on_train_epoch_end(self):
-        # if hasattr(self, "train_codebook_losses"):
-        #     self.train_codebook_losses = torch.stack(self.train_codebook_losses).mean(0)
+        # Handle train codebook losses
         if hasattr(self, "train_codebook_loss_sum") and self.train_codebook_loss_count > 0:
             mean_loss = self.train_codebook_loss_sum / self.train_codebook_loss_count
             self.train_codebook_epoch_loss = mean_loss  # tensor ready for ClearML
         # reset
-        del self.train_codebook_loss_sum
-        del self.train_codebook_loss_count
+        if hasattr(self, "train_codebook_loss_sum"):
+            del self.train_codebook_loss_sum
+        if hasattr(self, "train_codebook_loss_count"):
+            del self.train_codebook_loss_count
         super().on_train_epoch_end()
 
     def on_validation_epoch_end(self):
-        # if hasattr(self, "val_codebook_losses"):
-        #     self.val_codebook_losses = torch.stack(self.val_codebook_losses).mean(0)
+        # Handle codebook losses
         if hasattr(self, "val_codebook_loss_sum") and self.val_codebook_loss_count > 0:
             mean_loss = self.val_codebook_loss_sum / self.val_codebook_loss_count
             self.val_codebook_epoch_loss = mean_loss  # tensor ready for ClearML
         # reset
-        del self.val_codebook_loss_sum
-        del self.val_codebook_loss_count
+        if hasattr(self, "val_codebook_loss_sum"):
+            del self.val_codebook_loss_sum
+        if hasattr(self, "val_codebook_loss_count"):
+            del self.val_codebook_loss_count
+        
+        # Clear validation predictions to free memory
+        if hasattr(self, 'val_predictions'):
+            del self.val_predictions
+
+        if hasattr(self, 'val_predictions_teacher_forcing'):
+            del self.val_predictions_teacher_forcing
+            
         super().on_validation_epoch_end()
 

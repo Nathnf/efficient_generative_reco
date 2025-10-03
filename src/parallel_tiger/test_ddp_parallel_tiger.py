@@ -85,7 +85,7 @@ def test_ddp(cfg: DictConfig):
             logger.error(f"Error fetching training tasks: {e}")
         task = Task.init(
             project_name=cfg.project_name,
-            task_name=cfg.infer.experiment_name,
+            task_name=cfg.infer.experiment_name+cfg.infer.suffix,
             task_type=Task.TaskTypes.inference,
             reuse_last_task_id=False,
         )
@@ -124,6 +124,19 @@ def test_ddp(cfg: DictConfig):
 
     test_data = load_test_dataset(cfg)
     all_items = test_data.get_all_items()
+
+    # # Manually compute all_items from the index json file
+    # path = os.path.join(
+    #     cfg.dataset.data_path,
+    #     cfg.dataset.name,
+    #     cfg.dataset.name + cfg.dataset.index_file
+    # )
+    # with open(path, "r") as f:
+    #     index_data = json.load(f)
+    #     all_items = set()
+    #     for index in index_data.values():
+    #         all_items.add("".join(index))
+    # print("999999, len(all_items): {}".format(len(all_items)))
 
     # TODO: PUT THAT IN A FUNCTION (and call it elsewhere?)
     all_items_tok_split = [parse_item(item) for item in all_items]
@@ -205,6 +218,7 @@ def test_ddp(cfg: DictConfig):
             test_loader.dataset.set_prompt(prompt_id)
             metrics_results = {}
             total = 0
+            correct_pred_no_total, incorrect_pred_no_total = 0, 0
 
             for step, batch in enumerate(tqdm(test_loader)):
                 inputs = batch[0].to(device)
@@ -263,13 +277,18 @@ def test_ddp(cfg: DictConfig):
                 save_dict["all_users"] = all_users
 
                 if local_rank == 0:
-                    topk_res = get_topk_results(
+                    topk_res, correct_pred_no, incorrect_pred_no = get_topk_results(
                         output,
                         scores,
                         targets,
                         num_beams,
-                        all_items=all_items if cfg.infer.filter_items else None,
+                        all_items=all_items,
+                        filter_invalid=cfg.infer.filter_items,
+                        per_level_stats=cfg.infer.per_level_stats
                     )
+                    correct_pred_no_total += correct_pred_no
+                    incorrect_pred_no_total += incorrect_pred_no
+                    
                     batch_metrics_res = get_metrics_results(topk_res, metrics)
                     for m, res in batch_metrics_res.items():
                         if m not in metrics_results:
@@ -295,6 +314,10 @@ def test_ddp(cfg: DictConfig):
                 logger.info("Prompt {} results: {}".format(prompt_id, metrics_results))
                 logger.info("======================================================")
                 logger.info("")
+
+                # Correct vs incorrect predictions
+                logger.info(f"Total correct predictions: {correct_pred_no_total}, Total incorrect predictions: {incorrect_pred_no_total}")
+                logger.info(f"Ratio of correct predictions: {correct_pred_no_total / (correct_pred_no_total + incorrect_pred_no_total):.4f}")
 
                 # --- ClearML: log per-prompt metrics ---
                 if task is not None:

@@ -1,8 +1,10 @@
 infer: 
   experiment_name: "${exp_name}_inference"
+  suffix: ""  # Suffix to add to ClearML task name
   generation_mode: "parallel_beam_search" # 'parallel_beam_search' or 'autoregressive_beam_search' (autoregressive not supported yet)
   ckpt_dir: "${output_dir}"
-  output_dir: "${output_dir}/inference/${infer.generation_mode}" # NOT USED CURRENTLY?
+  output_dir: "${output_dir}/inference/${infer.generation_mode}"
+  fast_generation: false
   test_batch_size: 256
   num_beams: 20
   test_task: "seqrec"
@@ -10,19 +12,21 @@ infer:
   save_file: "${infer.output_dir}/save_${infer.test_task}_${infer.num_beams}.json"
   use_constraints: true
   filter_items: true
-
   sample_num: -1  # test sample number, -1 represents using all test data
   gpu_id: 0
   test_prompt_ids: "0"  # test prompt ids, separate by comma. 'all' represents using all
   metrics: "hit@1,hit@5,hit@10,ndcg@5,ndcg@10"  # test metrics, separate by comma
   debug: false
-
   enable_clearml: true
-
   stochastic_decoding: false
   temperatures: [1.0, 1.0, 1.0, 1.0]
-
   do_sample: false
+  first_token_constraints_path: "${dataset.data_path}/${dataset.name}/fast_first_token_constraints_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t1_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t1_codenum${code_num}_${quantizer_type}.pt"
+  transition_constraints_t2_path: "${dataset.data_path}/${dataset.name}/fast_transition_constraints_t2_codenum${code_num}_${quantizer_type}.pt"
+  prefix_to_uidx_t3_path: "${dataset.data_path}/${dataset.name}/prefix_to_uidx_t3_codenum${code_num}_${quantizer_type}.pt"
+  uidx_to_next_tokens_t3_path: "${dataset.data_path}/${dataset.name}/uidx_to_next_tokens_t3_codenum${code_num}_${quantizer_type}.pt"
+  per_level_stats: false
 
 dataloader:
   num_workers: 8

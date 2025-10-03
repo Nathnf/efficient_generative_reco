@@ -183,6 +183,125 @@ class CurriculumCallback(pl.Callback):
                 iteration=epoch
             )
 
+class EfficientValidationMetricsCallback(pl.Callback):
+    """
+    More efficient callback that computes metrics directly from validation predictions
+    without needing separate inference passes.
+    """
+    def __init__(self, tokenizer, cfg, every_n_epochs=1, task=None):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.cfg = cfg
+        self.every_n_epochs = every_n_epochs
+        self.task = task
+        self.all_items = None  # Will be set when first validation batch is processed
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        # Clear accumulated predictions at the start of each validation epoch
+        if hasattr(pl_module, 'val_predictions'):
+            pl_module.val_predictions = []
+        if hasattr(pl_module, 'val_predictions_teacher_forcing'):
+            pl_module.val_predictions_teacher_forcing = []
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # only run every N epochs
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+
+        def _gather_and_evaluate(attribute_name='val_predictions', metric_prefix='val_metrics'):
+            # Check if we have predictions from validation steps
+            if not hasattr(pl_module, attribute_name) or not getattr(pl_module, attribute_name):
+                # logger.warning(f"No {attribute_name} available for metrics computation")
+                return
+
+            # Gather predictions from all devices
+            gathered_preds = gather_predictions(getattr(pl_module, attribute_name))
+            
+            if not gathered_preds:
+                return
+
+            # Get all_items from first batch if not set (assumes all batches have same structure)
+            if self.all_items is None:
+                # You might need to adjust this based on how your validation dataset provides all_items
+                # For now, we'll assume it's available in the config or can be computed
+                logger.warning("all_items not set in EfficientValidationMetricsCallback - metrics might be inaccurate")
+                self.all_items = None
+
+            # Evaluate predictions
+            metrics = evaluate_predictions_gathered(
+                gathered_preds,
+                tokenizer=self.tokenizer,
+                all_items=self.all_items,
+                pl_module=pl_module,
+                cfg=self.cfg,
+                mode="valid",
+                decode_targets=True
+            )
+
+            for m, val in metrics.items():
+                if trainer.logger:
+                    trainer.logger.log_metrics({f"{metric_prefix}/{m}": val}, step=trainer.current_epoch)
+                show_on_prog_bar = m in ["hit@10", "ndcg@10"]
+                pl_module.log(f"{metric_prefix}/{m}", val, prog_bar=show_on_prog_bar, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Process regular predictions
+        _gather_and_evaluate(attribute_name='val_predictions', metric_prefix='val_metrics')
+        
+        # Process teacher forcing predictions (only exists for RQTransformer)
+        _gather_and_evaluate(attribute_name='val_predictions_teacher_forcing', metric_prefix='val_tf_metrics')
+
+    def set_all_items(self, all_items):
+        """Allow setting all_items from outside if needed"""
+        self.all_items = all_items
+
+
+def set_model_constraints(
+    pl_module, cfg, tokenizer, dataset, prefix="valid"
+):
+    all_items = dataset.get_all_items()
+    # # Manually compute all_items from the index json file
+    # import json
+    # path = os.path.join(
+    #     cfg.dataset.data_path,
+    #     cfg.dataset.name,
+    #     cfg.dataset.name + cfg.dataset.index_file
+    # )
+    # with open(path, "r") as f:
+    #     index_data = json.load(f)
+    #     all_items = set()
+    #     for index in index_data.values():
+    #         all_items.add("".join(index))
+    # print("999999, len(all_items): {}".format(len(all_items)))
+
+    (
+        first_token_constraints,
+        transition_mask_t1,
+        transition_mask_t2,
+        prefix_to_uidx_t3,
+        uidx_to_next_tokens_t3,
+    ) = compute_or_load_transition_constraints_codebook_fast(
+        cfg=cfg,
+        tokenizer=tokenizer,
+        all_items=all_items,
+        first_token_constraints_path=getattr(cfg, prefix).first_token_constraints_path,
+        transition_constraints_t1_path=getattr(cfg, prefix).transition_constraints_t1_path,
+        transition_constraints_t2_path=getattr(cfg, prefix).transition_constraints_t2_path,
+        prefix_to_uidx_t3_path=getattr(cfg, prefix).prefix_to_uidx_t3_path,
+        uidx_to_next_tokens_t3_path=getattr(cfg, prefix).uidx_to_next_tokens_t3_path,
+        num_special_tokenizer_tokens=len(tokenizer.special_tokens_map),
+    )
+
+    pl_module.model.set_first_token_constraint_mask(first_token_constraints)
+    pl_module.model.set_transition_constraint_masks(transition_mask_t1, transition_mask_t2)
+    pl_module.model.set_transition_constraints_fast_t3(prefix_to_uidx_t3, uidx_to_next_tokens_t3)
+
+    candidate_trie = Trie([tokenizer.encode(c) for c in all_items])
+    pl_module.model.set_candidate_trie(candidate_trie)
+
+    return all_items
+
+
+
 
 def train(cfg: DictConfig):
     result = initialize_logging_task(cfg)
@@ -267,36 +386,50 @@ def train(cfg: DictConfig):
 
     pl_module = LitRQQTransformer(
         model=model,
-        lr=cfg.train.learning_rate,
-        weight_decay=cfg.train.weight_decay,
-        lr_scheduler_type=cfg.train.lr_scheduler,
-        warmup_steps=cfg.train.warmup_steps,
+        cfg=cfg,
         distributed=ddp,
-        topK=cfg.infer.num_beams, # IF NEEDED, OVERRIDE DURING INFERENCE
-        use_constraints=cfg.infer.use_constraints, # IDEM
     )
 
-    early_stopping = EarlyStopping(
-        monitor="eval_loss",
-        mode="min",
-        patience=cfg.train.early_stopping_patience,
-        verbose=False,
-    )
+    if cfg.train.compute_val_metrics:
+        early_stopping = EarlyStopping(
+            monitor="val_metrics/hit@10",
+            mode="max",
+            patience=cfg.train.early_stopping_patience,
+            verbose=False,
+        )
+        checkpoint = ModelCheckpoint(
+            save_top_k=1, 
+            monitor="val_metrics/hit@10",
+            mode="max", 
+            save_weights_only=True,
+            dirpath=cfg.output_dir,
+            filename="best-checkpoint"
+        )
+    else:
+        early_stopping = EarlyStopping(
+            monitor="eval_loss",
+            mode="min",
+            patience=cfg.train.early_stopping_patience,
+            verbose=False,
+        )
+        checkpoint = ModelCheckpoint(
+            save_top_k=1, 
+            monitor="eval_loss",
+            mode="min", 
+            save_weights_only=True,
+            dirpath=cfg.output_dir,
+            filename="best-checkpoint"
+        )
     model_summary = ModelSummary(max_depth=4)
-    checkpoint = ModelCheckpoint(
-        save_top_k=1, 
-        monitor="eval_loss",
-        mode="min", 
-        save_weights_only=True,
-        dirpath=cfg.output_dir,
-        filename="best-checkpoint"
-    )
     progress_bar = TQDMProgressBar(refresh_rate=100)
     lr_monitor = LearningRateMonitor(logging_interval='step')
     grad_norm_logger = GradNormLogger()
-    codebook_logger_train = ClearMLCodebookLogger(title="train_codebook_loss", mode="train")
-    codebook_logger_val = ClearMLCodebookLogger(title="val_codebook_loss", mode="val")
-    callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger, codebook_logger_train, codebook_logger_val]
+    callbacks = [early_stopping, model_summary, checkpoint, progress_bar, lr_monitor, grad_norm_logger]
+    if cfg.train.get("log_codebook_losses", False):
+        codebook_logger_train = ClearMLCodebookLogger(title="train_codebook_loss", mode="train")
+        codebook_logger_val = ClearMLCodebookLogger(title="val_codebook_loss", mode="val")
+        callbacks.append(codebook_logger_train)
+        callbacks.append(codebook_logger_val)
 
     if cfg.train.get("enable_curriculum", False):
         assert cfg.train.training_mode == "masked", "Curriculum learning only makes sense with masked training"
@@ -312,6 +445,19 @@ def train(cfg: DictConfig):
         )
         callbacks.append(curriculum_callback)
 
+    if cfg.train.get("compute_val_metrics", False) and cfg.train.check_val_every_n_epoch > 0:
+        val_metrics_callback = EfficientValidationMetricsCallback(
+            tokenizer=tokenizer,
+            cfg=cfg,
+            every_n_epochs=cfg.train.check_val_every_n_epoch,
+            task=task,
+        )
+        valid_all_items = set_model_constraints(
+            pl_module, cfg, tokenizer, valid_data, prefix="valid"
+        )
+        val_metrics_callback.set_all_items(valid_all_items)   
+        callbacks.append(val_metrics_callback)
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices="auto",
@@ -323,7 +469,7 @@ def train(cfg: DictConfig):
         check_val_every_n_epoch=cfg.train.check_val_every_n_epoch,
         log_every_n_steps=cfg.train.logging_step,
         default_root_dir=cfg.output_dir,
-        limit_val_batches=cfg.train.limit_val_batches,
+        # limit_val_batches=cfg.train.limit_val_batches,
         callbacks=callbacks,
         enable_checkpointing=True,
         inference_mode=False,
@@ -352,20 +498,16 @@ def train(cfg: DictConfig):
         logger.info("Suggested LR: %s", new_lr)
         pl_module.lr = new_lr
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     trainer.fit(
         pl_module,
         train_dataloaders=train_dataloader,
         val_dataloaders=valid_dataloader,
     )
-    training_time = time.time() - start_time
+    training_time = time.perf_counter() - start_time
     logger.info('training_time: {}'.format(training_time))
 
     pl_module.load_state_dict(torch.load(checkpoint.best_model_path)["state_dict"])
-    # TODO: save model as well (or already done by checkpoint?)
-
-    # if local_rank == 0:
-    #     logger.debug("Model state dict after training: \n{}".format(model.state_dict()))
 
     if task is not None:
         task.get_logger().report_single_value('learning_rate', new_lr if new_lr is not None else cfg.train.learning_rate)
@@ -384,7 +526,9 @@ def predict(
 ):
     test_data = load_test_dataset(cfg)
     logger.info(f"Test dataset size: {len(test_data)} sequences")
-    all_items = test_data.get_all_items()
+    all_items = set_model_constraints(
+        pl_module, cfg, tokenizer, test_data, prefix="infer"
+    )
     logger.info("test sequence")
     logger.info("{}".format(test_data[min(100, len(test_data) - 1)]))
 
@@ -397,34 +541,10 @@ def predict(
         # pin_memory=True,
     )
 
-    (
-        first_token_constraints_fast,
-        transition_mask_t1,
-        transition_mask_t2,
-        prefix_to_uidx_t3,
-        uidx_to_next_tokens_t3,
-    ) = compute_or_load_transition_constraints_codebook_fast(
-        cfg=cfg,
-        tokenizer=tokenizer,
-        all_items=all_items,
-        first_token_constraints_path=cfg.infer.first_token_constraints_path,
-        transition_constraints_t1_path=cfg.infer.transition_constraints_t1_path,
-        transition_constraints_t2_path=cfg.infer.transition_constraints_t2_path,
-        prefix_to_uidx_t3_path=cfg.infer.prefix_to_uidx_t3_path,
-        uidx_to_next_tokens_t3_path=cfg.infer.uidx_to_next_tokens_t3_path,
-        num_special_tokenizer_tokens=len(tokenizer.special_tokens_map),
-    )
-    pl_module.model.set_first_token_constraint_mask(first_token_constraints_fast)
-    pl_module.model.set_transition_constraint_masks(transition_mask_t1, transition_mask_t2)
-    pl_module.model.set_transition_constraints_fast_t3(prefix_to_uidx_t3, uidx_to_next_tokens_t3)
-
-    candidate_trie = Trie([tokenizer.encode(candidate) for candidate in all_items])
-    pl_module.model.set_candidate_trie(candidate_trie)
-
-    start_time = time.time()
+    start_time = time.perf_counter()
     local_preds = trainer.predict(pl_module, dataloaders=test_dataloader)
     print("device: ", pl_module.device, "len(preds): ", len(local_preds) if local_preds is not None else 0)
-    inference_time = time.time() - start_time
+    inference_time = time.perf_counter() - start_time
     logger.info('exact inference time: %s (only trainer.predict)', inference_time)
 
     if task:
@@ -448,7 +568,15 @@ def gather_predictions(preds):
     return all_preds
 
 
-def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, cfg):
+def evaluate_predictions_gathered(
+    predictions, 
+    tokenizer, 
+    all_items, 
+    pl_module, 
+    cfg, 
+    mode="test",
+    decode_targets=False
+    ):
     """
     Evaluate predictions returned by trainer.predict.
     Args:
@@ -462,14 +590,19 @@ def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, 
         tokenizer: custom tokenizer
         all_items: full item vocabulary
         cfg: config
+        mode: "test" or "valid" for logging purposes
     Returns:
         metrics_results: dict with aggregated results per metric
     """
+    assert mode in ["test", "valid"], "mode must be 'test' or 'valid'"
     metrics = cfg.infer.metrics.split(",")
     metrics_results = {}
     total = 0
+    correct_pred_no_total, incorrect_pred_no_total = 0, 0
 
-    for step, batch in enumerate(tqdm(predictions, desc="Evaluating", unit="batch")):
+    # show_progress = (mode == "test") and get_rank() == 0
+    show_progress = (mode == "test")
+    for step, batch in enumerate(tqdm(predictions, desc="Evaluating", unit="batch", disable=not show_progress)):
         output_ids = batch["preds"]           # (bs, num_beams, seq_len)
         scores = batch["scores"]       # (bs, num_beams)
         targets = batch["targets"]
@@ -485,14 +618,22 @@ def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, 
             output_ids, skip_special_tokens=True
         )
 
+        if decode_targets:
+            # in this case, `targets` is a list of list of token ids
+            targets = [tokenizer.decode(t, skip_special_tokens=True).strip().replace(" ", "") for t in targets]
+
         # Now compute top-k results & metrics
-        topk_res = get_topk_results(
+        topk_res, correct_pred_no, incorrect_pred_no = get_topk_results(
             predictions=decoded_outputs,
             scores=scores.cpu().tolist(),
             targets=targets,
             k=pl_module.topK,
-            all_items=all_items if cfg.infer.filter_items else None,
+            all_items=all_items,
+            filter_invalid=cfg.infer.filter_items,
+            per_level_stats=cfg.infer.per_level_stats and mode == "test",
         )
+        correct_pred_no_total += correct_pred_no
+        incorrect_pred_no_total += incorrect_pred_no
 
         batch_metrics_res = get_metrics_results(topk_res, metrics)
 
@@ -510,9 +651,15 @@ def evaluate_predictions_gathered(predictions, tokenizer, all_items, pl_module, 
             logger.info("Metrics results: {}".format(temp))
 
     # Normalize by number of targets
-    logger.info(f"Total number of sequences (evaluation time): {total}")
+    if mode == "test":
+        logger.info(f"Total number of sequences (evaluation time): {total}")
     for m in metrics_results:
         metrics_results[m] /= total
+
+    # Incorrect vs correct predictions
+    if mode == "test" or incorrect_pred_no_total > 0:
+        logger.info(f"Total correct predictions: {correct_pred_no_total}, Total incorrect predictions: {incorrect_pred_no_total}")
+        logger.info(f"Ratio of correct predictions: {correct_pred_no_total / (correct_pred_no_total + incorrect_pred_no_total):.4f}")
 
     return metrics_results
 
@@ -530,7 +677,7 @@ def main(cfg: DictConfig):
     trainer, pl_module, tokenizer, task = train(cfg)
     preds, all_items = predict(cfg, trainer, pl_module, tokenizer, task)
     if get_rank() == 0:
-        metrics = evaluate_predictions_gathered(preds, tokenizer, all_items, pl_module, cfg)
+        metrics = evaluate_predictions_gathered(preds, tokenizer, all_items, pl_module, cfg, mode="test")
 
     if task:
         for key, value in metrics.items():
@@ -541,8 +688,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-
-
-# NB: REFLECHIR A COMMENT JE PEUX TESTER PLUSIEURS CHOSES AVEC LE MEME ENTRAINEMENT (ex. greedy or stochastic sampling, different temperatures, etc.)
-# IDEE QUI ME VIENT: 
-# BOUCLE SUR LE NOMBRE DE PARAMETRES A TESTER / CONFIG D'INFERENCE A TESTER? --> AUTANT DE PREDICTIONS QUE NECESSAIRES

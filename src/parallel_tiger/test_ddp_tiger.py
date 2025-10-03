@@ -49,6 +49,205 @@ def gather_list(target, world_size):
     return all_device_target
 
 
+from parallel_tiger.model.base_rq_transformer import safe_log_softmax
+
+class AutoregressiveGenerateWithConstraints:
+    def __init__(self, model, num_tokens=256, num_query=4, num_special_tokens=4):
+        self.model = model
+        self.num_tokens = num_tokens
+        self.num_query = num_query
+        self.num_special_tokens = num_special_tokens
+        self.candidate_trie = None
+        self.first_token_constraint_mask = None
+        self.transition_constraint_masks = {1: None, 2: None}
+        self.prefix_to_uidx_t3 = None
+        self.uidx_to_next_tokens_t3 = None
+        
+    def set_candidate_trie(self, candidate_trie: Trie):
+        self.candidate_trie = candidate_trie
+
+    def _set_first_token_constraint_mask(self, first_token_constraint_mask):
+        self.first_token_constraint_mask = first_token_constraint_mask.to(dtype=torch.bool)
+
+    def _set_transition_constraint_masks(self, transition_mask_t1, transition_mask_t2):
+        self.transition_constraint_masks = {
+            1: transition_mask_t1.to(dtype=torch.bool),
+            2: transition_mask_t2.to(dtype=torch.bool),
+        }
+
+    def _set_transition_constraints_fast_t3(self, prefix_to_uidx_t3, uidx_to_next_tokens_t3):
+        self.prefix_to_uidx_t3 = prefix_to_uidx_t3.to(dtype=torch.long)
+        self.uidx_to_next_tokens_t3 = uidx_to_next_tokens_t3.to(dtype=torch.bool)
+
+    def set_fast_constraints(
+        self,
+        first_token_constraint_mask,
+        transition_mask_t1,
+        transition_mask_t2,
+        prefix_to_uidx_t3,
+        uidx_to_next_tokens_t3,
+    ):
+        self._set_first_token_constraint_mask(first_token_constraint_mask)
+        self._set_transition_constraint_masks(transition_mask_t1, transition_mask_t2)
+        self._set_transition_constraints_fast_t3(prefix_to_uidx_t3, uidx_to_next_tokens_t3)
+
+    def _get_valid_mask(self, step, logits, flattened_beams=None, use_constraints=True):
+        """Return an additive logits mask (0 for allowed, -inf for disallowed) at a decoding step.
+        Uses specialized precomputed masks if available, otherwise falls back to the trie."""
+
+        if not use_constraints:
+            return torch.zeros_like(logits)
+
+        device = logits.device
+
+        if step == 0:
+            if self.first_token_constraint_mask is not None:
+                first_token_constraint_mask = self.first_token_constraint_mask.to(device=device)
+                valid_tokens_mask = torch.zeros_like(logits).masked_fill(~first_token_constraint_mask, float("-inf"))
+                return valid_tokens_mask
+            else:
+                assert self.candidate_trie is not None, "Trie needs to be set"
+                valid_tokens_mask = torch.full_like(logits, float('-inf'))
+                valid_next_tokens = self.candidate_trie.get([]) # type: ignore[OptionalMemberAccess]
+                local_valid_next_tokens = [self._global_to_local_id(t, 0) for t in valid_next_tokens]
+                valid_tokens_mask[:, local_valid_next_tokens] = 0.
+                return valid_tokens_mask
+            
+        assert flattened_beams is not None
+        # flat_tokens: (b*topK, step)
+
+        def _global_to_local_beam_ids(global_ids, step, device):
+            depth_idx = torch.arange(step, device=device)[None, :]  # (1, step)
+            return global_ids - (self.num_special_tokens + depth_idx * self.num_tokens)
+
+        if step in (1, 2) and self.transition_constraint_masks[step] is not None:
+            mask = self.transition_constraint_masks[step].to(device=device) # (num_tokens, num_tokens) or (num_tokens, num_tokens, num_tokens)
+            flattened_beams_loc = _global_to_local_beam_ids(flattened_beams, step, device)
+            valid_mask = mask[flattened_beams_loc[:, 0]] if step == 1 else mask[flattened_beams_loc[:, 0], flattened_beams_loc[:, 1]]
+            # print("valid_mask.shape, logits.shape:", valid_mask.shape, logits.shape)
+            return torch.zeros_like(logits).masked_fill(~valid_mask, float("-inf"))
+
+        elif step == 3 and self.prefix_to_uidx_t3 is not None and self.uidx_to_next_tokens_t3 is not None:
+                # prefix_to_uidx_t3: (codebook_num, codebook_num, codebook_num) - transition mask for t=3
+                # uidx_to_next_tokens_t3: (|U|, code_num) - valid next tokens for each unique prefix of length 3
+                prefix_to_uidx_t3 = self.prefix_to_uidx_t3.to(device=device)
+                uidx_to_next_tokens_t3 = self.uidx_to_next_tokens_t3.to(device=device)
+                flattened_beams_loc = _global_to_local_beam_ids(flattened_beams, step, device)
+                uidx = prefix_to_uidx_t3[flattened_beams_loc[:, 0], flattened_beams_loc[:, 1], flattened_beams_loc[:, 2]]
+                valid_mask = uidx_to_next_tokens_t3[uidx]
+                valid_tokens_mask = torch.zeros_like(logits).masked_fill(~valid_mask, float("-inf"))
+                return valid_tokens_mask
+        
+        # Fallback: Trie
+        assert self.candidate_trie is not None, "Trie needs to be set"
+        valid_tokens_mask = torch.full_like(logits, float('-inf'))
+        for beam_id, prefix in enumerate(flattened_beams.tolist()):
+            valid_next_tokens = self.candidate_trie.get(prefix) # type: ignore[OptionalMemberAccess]
+            # reverse offset
+            valid_next_tokens = [self._global_to_local_id(t, step) for t in valid_next_tokens]
+            valid_tokens_mask[beam_id, valid_next_tokens] = 0.
+
+        return valid_tokens_mask
+
+    # def _local_to_global_id(self, local_id, depth_idx):
+    #     return local_id + depth_idx * self.num_tokens + self.num_special_tokens
+
+    def _global_to_local_id(self, global_id, depth_idx):
+        # return (global_id - self.num_special_tokens) % self.num_tokens
+        return global_id - (self.num_special_tokens + depth_idx * self.num_tokens)
+
+    def generate(self, input_ids, attention_mask, num_beams=20, do_sample=False):
+        batch_size = input_ids.size(0)
+        decoder_input_ids = torch.zeros(
+            (batch_size, 1),
+            dtype=torch.long,
+            device=input_ids.device,
+        )
+        logits0 = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+        ).logits  # (bs, seq_len, vocab_size)
+        # print("step 0 - logits0.shape (before slicing):", logits0.shape)
+        next_token_logits = logits0[:, -1, :]  # (bs, vocab_size)
+        next_token_logits = next_token_logits[:, self.num_special_tokens: self.num_special_tokens + self.num_tokens]  # (bs, num_tokens)
+        # print("next_token_logits.shape:", next_token_logits.shape)
+        valid_mask = self._get_valid_mask(step=0, logits=next_token_logits, use_constraints=True)
+        next_token_logits = next_token_logits + valid_mask
+        if do_sample:
+            probs = torch.softmax(next_token_logits, dim=-1)  # (bs, num_tokens)
+            next_tokens = torch.multinomial(probs, num_samples=num_beams)  # (bs, num_beams)
+            next_token_scores = safe_log_softmax(next_token_logits, dim=-1).gather(1, next_tokens)  # (bs, num_beams)
+        else:
+            log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (bs, num_tokens)
+            next_token_scores, next_tokens = torch.topk(log_probs, k=num_beams, dim=-1)  # both (bs, num_beams)
+
+        next_tokens = next_tokens + self.num_special_tokens  # adjust for offset
+        beam_scores = next_token_scores  # (bs, num_beams)
+        beam_tokens = next_tokens.unsqueeze(-1)  # (bs, num_beams, 1)
+
+        for step in range(1, self.num_query):
+            flattened_beams = beam_tokens.view(-1, beam_tokens.size(-1))  # (bs * num_beams, seq_len)
+            flat_scores = beam_scores.view(-1)  # (bs * num_beams,)
+
+            # Prepare the decoder inputs
+            decoder_input_ids = torch.cat(
+                [
+                    torch.zeros(
+                        (batch_size, num_beams, 1),
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ),
+                    beam_tokens,
+                ],
+                dim=-1,
+            )  # (bs, num_beams, seq_len)
+            decoder_input_ids = decoder_input_ids.view(-1, decoder_input_ids.size(-1))  # (bs * num_beams, seq_len)
+            decoder_attention_mask = torch.ones_like(decoder_input_ids)  # (bs * num_beams, seq_len)
+
+            logits = self.model(
+                input_ids=input_ids.unsqueeze(1).expand(-1, num_beams, -1).reshape(-1, input_ids.size(-1)),  # (bs * num_beams, seq_len)
+                attention_mask=attention_mask.unsqueeze(1).expand(-1, num_beams, -1).reshape(-1, attention_mask.size(-1)),  # (bs * num_beams, seq_len)
+                decoder_input_ids=decoder_input_ids,
+                decoder_attention_mask=decoder_attention_mask,
+            ).logits  # (bs * num_beams, seq_len, vocab_size)
+            # print(f"step {step} - logits.shape:", logits.shape)
+            next_token_logits = logits[:, -1, :]  # (bs * num_beams, vocab_size)
+            # print("next_token_logits.shape (before slicing):", next_token_logits.shape)
+            next_token_logits = next_token_logits[:, self.num_special_tokens + step*self.num_tokens: self.num_special_tokens + (step+1)*self.num_tokens]  # (bs * num_beams, num_tokens)
+            # print("next_token_logits.shape:", next_token_logits.shape)
+
+            valid_mask = self._get_valid_mask(step=step, logits=next_token_logits, flattened_beams=flattened_beams, use_constraints=True)
+            next_token_logits = next_token_logits + valid_mask
+
+            if do_sample:
+                probs = torch.softmax(next_token_logits, dim=-1)  # (bs * num_beams, vocab_size)
+                next_tokens = torch.multinomial(probs, num_samples=num_beams).squeeze(1)  # (bs * num_beams, num_beams)
+                next_token_scores = safe_log_softmax(next_token_logits, dim=-1).gather(1, next_tokens)  # (bs * num_beams, num_beams)
+            else:
+                log_probs = torch.log_softmax(next_token_logits, dim=-1)  # (bs * num_beams, vocab_size)
+                next_token_scores, next_tokens = torch.topk(log_probs, k=num_beams, dim=-1)  # both (bs * num_beams, num_beams)
+
+            next_tokens = next_tokens + self.num_special_tokens + step * self.num_tokens  # adjust for offset
+
+            # Update beam scores and tokens
+            cand_scores = flat_scores[:, None] + next_token_scores  # (bs * num_beams, num_beams)
+            cand_beams = torch.cat((flattened_beams[:, None, :].repeat(1, num_beams, 1), next_tokens[..., None]), dim=-1)  # (bs * num_beams, num_beams, step+1)
+
+            # reshape to (bs, num_beams * num_beams)
+            cand_scores = cand_scores.view(batch_size, -1)  # (bs, num_beams * num_beams)
+            cand_beams = cand_beams.view(batch_size, -1, cand_beams.size(-1))  # (bs, num_beams * num_beams, step+1)
+
+            # prune to get the new beam scores and tokens
+            beam_scores, beam_idx = cand_scores.topk(num_beams, dim=-1)  # (b, num_beams)
+            batch_idx = torch.arange(batch_size, device=beam_tokens.device)[:, None]
+            beam_tokens = cand_beams[batch_idx, beam_idx]  # (b, num_beams, step+1)
+
+        # print({"sequences": beam_tokens, "sequences_scores": beam_scores})
+        # flatten the first two dimensions to ensure compatibility with MQL4GRec's original implementation
+        return {"sequences": beam_tokens.view(-1, beam_tokens.shape[-1]), "sequences_scores": beam_scores.view(-1)}
+
+
 def test_ddp(cfg: DictConfig):
 
     set_seed(cfg.seed)
@@ -78,7 +277,7 @@ def test_ddp(cfg: DictConfig):
             logger.error(f"Error fetching training tasks: {e}")
         task = Task.init(
             project_name=cfg.project_name,
-            task_name=cfg.infer.experiment_name,
+            task_name=cfg.infer.experiment_name+cfg.infer.suffix,
             task_type=Task.TaskTypes.inference,
             reuse_last_task_id=False,
         )
@@ -114,6 +313,20 @@ def test_ddp(cfg: DictConfig):
     test_data = load_test_dataset(cfg)
     all_items = test_data.get_all_items()
 
+    # # Manually compute all_items from the index json file
+    # path = os.path.join(
+    #     cfg.dataset.data_path,
+    #     cfg.dataset.name,
+    #     cfg.dataset.name + cfg.dataset.index_file
+    # )
+    # with open(path, "r") as f:
+    #     index_data = json.load(f)
+    #     all_items = set()
+    #     for index in index_data.values():
+    #         all_items.add("".join(index))
+    # # all_items = test_data.get_all_items()
+    # print("-N-N-N-N-N-N-, len(all_items): {}".format(len(all_items)))
+
     # # TODO: PUT THAT IN A FUNCTION (and call it elsewhere?)
     # all_items_tok_split = [parse_item(item) for item in all_items]
     # num_first_tokens = len(set(item[0] for item in all_items_tok_split))
@@ -132,13 +345,50 @@ def test_ddp(cfg: DictConfig):
     ddp_sampler = DistributedSampler(
         test_data, num_replicas=world_size, rank=local_rank, drop_last=True
     )
+    model = DistributedDataParallel(model, device_ids=[local_rank])
 
     candidate_trie = Trie(
         [[0] + tokenizer.encode(candidate) for candidate in all_items]
     )
-    prefix_allowed_tokens = prefix_allowed_tokens_fn(candidate_trie)
 
-    model = DistributedDataParallel(model, device_ids=[local_rank])
+    fast_generation = cfg.infer.fast_generation and cfg.custom_tokenizer
+    if fast_generation:
+        logger.info("Using fast generation with constraints.")
+        gen_module = AutoregressiveGenerateWithConstraints(
+            model = model.module,
+            num_tokens=cfg.code_num,
+            num_query=cfg.n_query,
+            num_special_tokens=special_tokenizer_tokens_num,
+        )
+        gen_module.set_candidate_trie(candidate_trie)
+        from parallel_tiger.generation.vectorized_constraints import compute_or_load_transition_constraints_codebook_fast
+        (
+            first_token_constraint_mask,
+            transition_mask_t1,
+            transition_mask_t2,
+            prefix_to_uidx_t3,
+            uidx_to_next_tokens_t3,
+        ) = compute_or_load_transition_constraints_codebook_fast(
+            cfg=cfg,
+            tokenizer=tokenizer,
+            all_items=all_items,
+            first_token_constraints_path=cfg.infer.first_token_constraints_path,
+            transition_constraints_t1_path=cfg.infer.transition_constraints_t1_path,
+            transition_constraints_t2_path=cfg.infer.transition_constraints_t2_path,
+            prefix_to_uidx_t3_path=cfg.infer.prefix_to_uidx_t3_path,
+            uidx_to_next_tokens_t3_path=cfg.infer.uidx_to_next_tokens_t3_path,
+            num_special_tokenizer_tokens=special_tokenizer_tokens_num,
+        )
+        gen_module.set_fast_constraints(
+            first_token_constraint_mask,
+            transition_mask_t1,
+            transition_mask_t2,
+            prefix_to_uidx_t3,
+            uidx_to_next_tokens_t3,
+        )
+    else:
+        logger.info("Using standard generation with constraints.")
+        prefix_allowed_tokens = prefix_allowed_tokens_fn(candidate_trie)
 
     prompt_ids = [0]
     logger.info("TASK: {}".format(cfg.infer.test_task))
@@ -176,6 +426,7 @@ def test_ddp(cfg: DictConfig):
             test_loader.dataset.set_prompt(prompt_id)
             metrics_results = {}
             total = 0
+            correct_pred_no_total, incorrect_pred_no_total = 0, 0
 
             for step, batch in enumerate(tqdm(test_loader)):
                 inputs = batch[0].to(device)
@@ -185,31 +436,31 @@ def test_ddp(cfg: DictConfig):
                 num_beams = cfg.infer.num_beams
 
                 start = t.perf_counter()
-                output = model.module.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    max_new_tokens=4,
-                    prefix_allowed_tokens_fn=prefix_allowed_tokens,
-                    num_beams=num_beams,
-                    num_return_sequences=num_beams,
-                    output_scores=True,
-                    return_dict_in_generate=True,
-                    early_stopping=True,
-                    do_sample=cfg.infer.do_sample,
-                )
+                if fast_generation:
+                    output = gen_module.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        num_beams=num_beams
+                    )
+                else:
+                    output = model.module.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        max_new_tokens=4,
+                        prefix_allowed_tokens_fn=prefix_allowed_tokens if cfg.infer.use_constraints else None,
+                        num_beams=num_beams,
+                        num_return_sequences=num_beams,
+                        output_scores=True,
+                        return_dict_in_generate=True,
+                        early_stopping=True,
+                        do_sample=cfg.infer.do_sample,
+                    )
                 torch.cuda.synchronize()
                 end = t.perf_counter()
                 inference_time.append(end - start)
 
-                output_ids = output["sequences"]  # (bs, num_beams, seq_len)
-                scores = output["sequences_scores"]  # (bs, num_beams)
-
-                # # Flatten the first two dimensions
-                # # to ensure compatibility with MQL4GRec's original implementation
-                # output_ids = output_ids.view(
-                #     -1, output_ids.shape[-1]
-                # )  # (bs * num_beams, seq_len)
-                # scores = scores.view(-1)  # (bs * num_beams,)
+                output_ids = output["sequences"]  # ??? (bs, num_beams, seq_len)
+                scores = output["sequences_scores"]  # ??? (bs, num_beams)
 
                 output = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
@@ -240,13 +491,18 @@ def test_ddp(cfg: DictConfig):
                 save_dict["all_users"] = all_users
 
                 if local_rank == 0:
-                    topk_res = get_topk_results(
+                    topk_res, correct_pred_no, incorrect_pred_no = get_topk_results(
                         output,
                         scores,
                         targets,
                         num_beams,
-                        all_items=all_items if cfg.infer.filter_items else None,
+                        all_items=all_items,
+                        filter_invalid=cfg.infer.filter_items,
+                        per_level_stats=cfg.infer.per_level_stats
                     )
+                    correct_pred_no_total += correct_pred_no
+                    incorrect_pred_no_total += incorrect_pred_no
+
                     batch_metrics_res = get_metrics_results(topk_res, metrics)
                     for m, res in batch_metrics_res.items():
                         if m not in metrics_results:
@@ -272,6 +528,10 @@ def test_ddp(cfg: DictConfig):
                 logger.info("Prompt {} results: {}".format(prompt_id, metrics_results))
                 logger.info("======================================================")
                 logger.info("")
+
+                # Correct vs incorrect predictions
+                logger.info(f"Total correct predictions: {correct_pred_no_total}, Total incorrect predictions: {incorrect_pred_no_total}")
+                logger.info(f"Ratio of correct predictions: {correct_pred_no_total / (correct_pred_no_total + incorrect_pred_no_total):.4f}")
 
                 # --- ClearML: log per-prompt metrics ---
                 if task is not None:
@@ -355,3 +615,4 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+

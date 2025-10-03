@@ -239,14 +239,19 @@ def compute_or_load_transition_constraints_codebook_fast(
 
     # Save if path provided
     if first_token_constraints_path:
+        os.makedirs(os.path.dirname(first_token_constraints_path), exist_ok=True)
         torch.save(first_token_constraints, first_token_constraints_path)
     if transition_constraints_t1_path:
+        os.makedirs(os.path.dirname(transition_constraints_t1_path), exist_ok=True)
         torch.save(transition_mask_t1, transition_constraints_t1_path)
     if transition_constraints_t2_path:
+        os.makedirs(os.path.dirname(transition_constraints_t2_path), exist_ok=True)
         torch.save(transition_mask_t2, transition_constraints_t2_path)
     if prefix_to_uidx_t3_path:
+        os.makedirs(os.path.dirname(prefix_to_uidx_t3_path), exist_ok=True)
         torch.save(prefix_to_uidx, prefix_to_uidx_t3_path)
     if uidx_to_next_tokens_t3_path:
+        os.makedirs(os.path.dirname(uidx_to_next_tokens_t3_path), exist_ok=True)
         torch.save(uidx_to_next_tokens, uidx_to_next_tokens_t3_path)
 
     return (

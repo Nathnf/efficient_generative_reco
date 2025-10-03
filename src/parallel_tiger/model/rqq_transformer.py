@@ -158,7 +158,7 @@ class RQQTransformer(BaseRQTransformer):
             use_query_vectors_mask,
             self.depth_seq_len,
         )
-        return loss, loss_per_codebook
+        return loss, loss_per_codebook, logits
 
     def generate(self, ids, attention_mask, topK=20, use_constraints=True):
         logits = self.forward_inference(ids, attention_mask)

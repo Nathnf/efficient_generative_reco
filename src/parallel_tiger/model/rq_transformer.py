@@ -1,4 +1,5 @@
 from parallel_tiger.model.base_rq_transformer import *
+from parallel_tiger.generation.beam_search_decoding_rq import ParallelBeamSearchGenerator
 
 class RQTransformer(BaseRQTransformer):
     def __init__(
@@ -108,7 +109,7 @@ class RQTransformer(BaseRQTransformer):
             None,  # RQTransformer always uses all query vectors, so no masking
             self.depth_seq_len,
         )
-        return loss, loss_per_codebook
+        return loss, loss_per_codebook, logits
 
     def generate(self, ids, attention_mask, topK=20, use_constraints=True):
         """
@@ -247,3 +248,19 @@ class RQTransformer(BaseRQTransformer):
             valid_tokens_mask[beam_id, valid_next_tokens] = 0.
 
         return valid_tokens_mask
+
+    def generate_teacher_forcing(self, ids, attention_mask, topK=20, use_constraints=True):
+        """
+        Generate topK candidates using teacher forcing (step-by-step with ground truth context).
+        This should provide logits computed from the same context as free-running generation.
+        """
+        # Compute logits without concatenating ground truth labels
+        logits, _ = self._get_logits_from_spatial_token(ids, attention_mask, spatial_index=-1)
+        
+        generator = ParallelBeamSearchGenerator(
+            model=self,
+            use_multi_head=True,
+            stochastic=False,  # LATER: NOT HARDCODE IT
+            temperatures=None, # IDEM
+        )
+        return generator.generate(logits, topK, use_constraints)

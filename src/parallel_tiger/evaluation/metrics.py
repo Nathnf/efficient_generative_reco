@@ -37,44 +37,32 @@ def get_eval_metrics_results(predictions, labels):
     return metric
 
 
-def get_topk_results(predictions, scores, targets, k, all_items=None):
+def get_topk_results(predictions, scores, targets, k, all_items, filter_invalid=True, per_level_stats=False):
     results = []
     B = len(targets)
-    # predictions = [_.split("Response:")[-1] for _ in predictions]
     predictions = [_.strip().replace(" ", "") for _ in predictions]
-    # print(predictions)##################
     incorrect_pred_no, correct_pred_no = 0, 0
 
-    # # logger.debug(f"Total predictions: {len(predictions)}")
-    # # logger.debug(f"Total targets: {len(targets)}")
-    # # logger.debug(f"Total scores: {len(scores)}")
-    # # logger.debug(f"all_items is not None: {all_items is not None}")
-    # print the first 10 elements of predictions, targets, scores
-    # logger.debug(f"First 10 predictions: {predictions[:10]}")
-    # logger.debug(f"First 10 targets: {targets[:10]}")
-    # logger.debug(f"First 10 scores: {scores[:10]}")
-    # invalid_count = 0
-    if all_items is not None:
-        for i, seq in enumerate(predictions):
-            if seq not in all_items:
-                # if invalid_count < 10:
-                #     print(f"Warning: {seq} not in all_items, setting score to -1000 (initially {scores[i]})")
-                # invalid_count += 1
-                incorrect_pred_no += 1
+    for i, seq in enumerate(predictions):
+        if seq not in all_items:
+            # if invalid_count < 10:
+            #     print(f"Warning: {seq} not in all_items, setting score to -1000 (initially {scores[i]})")
+            # invalid_count += 1
+            incorrect_pred_no += 1
+            if filter_invalid:
                 scores[i] = -1000
-            else:
-                correct_pred_no += 1
+        else:
+            correct_pred_no += 1
 
-    logger.debug(
-        "Total incorrect predictions: {}, Total correct predictions: {}".format(incorrect_pred_no, correct_pred_no)
-    )
-    logger.info("Ratio of correct predictions: {:.4f}".format(correct_pred_no / len(predictions)))
-
-    # # To get the ratio of correct predictions per codebook level
-    # n_query = 4
-    # if n_query is not None:
-    #     position_correct_counts = [0] * n_query
-    #     position_total_counts = [0] * n_query
+    # To get the ratio of correct predictions per codebook level
+    if per_level_stats:
+        n_query = 4
+        # position_correct_counts = [0] * n_query
+        # position_total_counts = [0] * n_query
+        position_correct_counts = [0] * n_query
+        position_total_counts = [B] * n_query  # one per example
+        subseq_correct_counts = [0] * n_query
+        subseq_total_counts = [0] * n_query
 
     # print(scores)
     for b in range(B):
@@ -85,35 +73,59 @@ def get_topk_results(predictions, scores, targets, k, all_items=None):
         # print(pairs)
         sorted_pairs = sorted(pairs, key=lambda x: x[1], reverse=True)
         target_item = targets[b]
-        one_results = []
+        target_tokens = parse_item(target_item)
+        candidate_tokens = [parse_item(seq) for seq, _ in sorted_pairs]
 
-        for sorted_pred in sorted_pairs:
-            if sorted_pred[0] == target_item:
-                one_results.append(1)
-            else:
-                one_results.append(0)
+        one_results = [1 if seq == target_item else 0 for seq, _ in sorted_pairs]
+        results.append(one_results)
 
-            # # To get the ratio of correct predictions per codebook level - 2
-            # if n_query is not None:
-            #     for i in range(n_query):
-            #         pred_tokens_list = parse_item(sorted_pred[0])
-            #         target_tokens_list = parse_item(target_item)
-            #         if pred_tokens_list[i] == target_tokens_list[i]:
+        if per_level_stats:
+            # # --- per-level accuracy ---
+            # for i in range(n_query):
+            #     for pred_tokens in candidate_tokens:
+            #         if pred_tokens[i] == target_tokens[i]:
             #             position_correct_counts[i] += 1
             #         position_total_counts[i] += 1
 
-        results.append(one_results)
+            # Collect tokens per level across all k candidates
+            tokens_per_level = [set() for _ in range(n_query)]
+            target_tokens = parse_item(targets[b])
+            for candidate in batch_seqs:
+                cand_tokens = parse_item(candidate)
+                for i in range(n_query):
+                    if cand_tokens[i] == target_tokens[i]:
+                        tokens_per_level[i].add(candidate)
+            
+            # If at least one candidate is correct at level i, count it
+            for i in range(n_query):
+                if len(tokens_per_level[i]) > 0:
+                    position_correct_counts[i] += 1
 
-    # # To get the ratio of correct predictions per codebook level - 3
-    # if n_query is not None:
-    #     position_accuracies = [
-    #         position_correct_counts[i] / position_total_counts[i] if position_total_counts[i] > 0 else 0
-    #         for i in range(n_query)
-    #     ]
-    #     for i, acc in enumerate(position_accuracies):
-    #         logger.debug("Position {}: {:.4f}".format(i, acc))
+            # --- per-subsequence (prefix) accuracy ---
+            for L in range(1, n_query + 1):
+                target_prefix = tuple(target_tokens[:L])
+                if any(tuple(pred[:L]) == target_prefix for pred in candidate_tokens):
+                    subseq_correct_counts[L-1] += 1
+                subseq_total_counts[L-1] += 1
 
-    return results
+
+    if per_level_stats:
+        position_accuracies = [
+            position_correct_counts[i] / position_total_counts[i] if position_total_counts[i] > 0 else 0
+            for i in range(n_query)
+        ]
+        subseq_accuracies = [
+            subseq_correct_counts[i] / subseq_total_counts[i] if subseq_total_counts[i] > 0 else 0
+            for i in range(n_query)
+        ]
+
+        for i, acc in enumerate(position_accuracies):
+            logger.debug(f"Per-level accuracy token {i+1}: {acc:.4f}")
+        
+        for i, acc in enumerate(subseq_accuracies):
+            logger.debug(f"Per-subsequence accuracy up to token {i+1}: {acc:.4f}")
+
+    return results, correct_pred_no, incorrect_pred_no
 
 
 def get_metrics_results(topk_results, metrics):
